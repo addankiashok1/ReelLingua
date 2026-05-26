@@ -8,7 +8,7 @@ AI-powered multilingual video dubbing and caption service. Upload an MP4, choose
 
 ```
 ReelSync AI
-├── reelsync-phase1/      ← FastAPI backend (Phases 1–3)
+├── reelsync-backend/     ← FastAPI backend (Phases 1–3)
 └── reelsync-frontend/    ← Next.js 14 frontend (Phase 3)
 ```
 
@@ -26,7 +26,7 @@ CORS configuration for the Next.js frontend, `/downloads` static asset route for
 ## Project Structure
 
 ```
-reelsync-phase1/
+reelsync-backend/
 ├── .env                       # API keys and secrets (never commit)
 ├── requirements.txt
 ├── main.py                    # FastAPI app, CORS, static mount, startup
@@ -43,8 +43,8 @@ reelsync-phase1/
 │   ├── auth.py                # /signup, /login, /me
 │   ├── videos.py              # /upload, /process, /jobs, /credits
 │   └── payments.py            # /phonepe-callback (S2S webhook)
-├── local_storage/             # Auto-created; holds input + output videos
-├── temp_outputs/              # Auto-created; ElevenLabs working files
+├── local_storage/             # Auto-created; holds input + output videos (gitignored)
+├── temp_outputs/              # Auto-created; ElevenLabs working files (gitignored)
 ├── test_run.py                # Phase 1 CLI entrypoint
 └── test_phonepe.py            # PhonePe webhook integration test
 
@@ -80,7 +80,7 @@ reelsync-frontend/
 ## Backend Setup
 
 ```bash
-cd reelsync-phase1
+cd reelsync-backend
 
 # Create and activate virtual environment
 python -m venv venv
@@ -93,7 +93,7 @@ pip install -r requirements.txt
 
 ### Environment Variables
 
-Create `reelsync-phase1/.env` (or root `.env`) with the following keys:
+Create `reelsync-backend/.env` with the following keys:
 
 ```env
 # Phase 1 — ElevenLabs
@@ -162,8 +162,6 @@ Direct MP4 stream from `local_storage/outputs/`.
 
 ## Supported Dubbing Languages
 
-ElevenLabs Dubbing API supported target languages:
-
 | Code | Language | Code | Language |
 |---|---|---|---|
 | `hi` | Hindi | `ko` | Korean |
@@ -189,17 +187,6 @@ ElevenLabs Dubbing API supported target languages:
 | New account | +3 minutes (free trial) |
 | Job completed | −1 minute |
 | PhonePe payment | +15 minutes (default) |
-
----
-
-## How Captions Work
-
-| Scenario | Behaviour |
-|---|---|
-| Long subtitle line | Wrapped at 88% of frame width |
-| Hindi / Indic script | `Nirmala.ttc` font loaded automatically |
-| Dubbed audio longer than video | Final frame held as still for overhang |
-| Dubbed audio shorter than video | Video trimmed to match audio length |
 
 ---
 

@@ -39,9 +39,9 @@ coverage.xml
 .ruff_cache/
 .tox/
 
-# ── Backend: generated video storage (can be large) ───────────
-reelsync-phase1/local_storage/
-reelsync-phase1/temp_outputs/
+# ── Backend: generated video storage (large binary files) ─────
+reelsync-backend/local_storage/
+reelsync-backend/temp_outputs/
 
 # ── Next.js frontend build artefacts ──────────────────────────
 reelsync-frontend/node_modules/
