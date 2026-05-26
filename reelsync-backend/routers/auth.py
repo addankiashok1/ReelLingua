@@ -1,20 +1,22 @@
 import logging
+import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+import bcrypt
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
-import bcrypt
-from sqlalchemy import or_, select
+from sqlalchemy import delete, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from config import settings
 from database import get_db
-from models.db_models import User
-from models.schemas import Token, UserCreate, UserLogin, UserOut
+from models.db_models import OTPVerification, User
+from models.schemas import OTPVerify, Token, UserCreate, UserLogin, UserOut
+from utils.email import send_otp_email
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -23,6 +25,9 @@ _bearer = HTTPBearer()
 
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_HOURS = 24
+OTP_EXPIRE_MINUTES = 5
+OTP_MAX_ATTEMPTS = 5
+
 
 # ─── Password helpers ─────────────────────────────────────────────────────────
 
@@ -80,14 +85,6 @@ async def _check_conflicts(
     email: str,
     phone_number: Optional[str],
 ) -> None:
-    """
-    Pre-flight check executed before any bcrypt hashing.
-
-    Runs a single OR query to detect email OR phone collisions in one
-    round-trip. If either field is already taken, raises HTTP 409 with a
-    message that names the exact conflicting field so the client can surface
-    a precise error to the user.
-    """
     conditions = [User.email == email]
     if phone_number:
         conditions.append(User.phone_number == phone_number)
@@ -110,70 +107,151 @@ async def _check_conflicts(
             )
 
 
-# ─── Endpoints ────────────────────────────────────────────────────────────────
+# ─── POST /signup-request ─────────────────────────────────────────────────────
 
 @router.post(
-    "/signup",
-    response_model=Token,
-    status_code=status.HTTP_201_CREATED,
-    summary="Register a new user account",
+    "/signup-request",
+    status_code=status.HTTP_200_OK,
+    summary="Initiate signup — validates input and emails a 6-digit OTP",
 )
-async def signup(body: UserCreate, db: AsyncSession = Depends(get_db)):
+async def signup_request(
+    body: UserCreate,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+):
     """
-    Registration flow with two-layer duplicate protection:
+    Step 1 of the two-step signup flow.
 
-    Layer 1 — Pre-flight query (fast path):
-        Checks email AND phone_number against the users table in a single
-        OR query *before* bcrypt runs. Returns a field-specific 409 if
-        either value is already taken, avoiding wasted CPU on hashing.
+    Validates all input via the UserCreate schema (email format, domain
+    blacklist, password length, phone normalization), checks for existing
+    accounts, then stores a short-lived OTP record and fires the email in a
+    BackgroundTask so the response returns immediately.
 
-    Layer 2 — IntegrityError catch (race-condition safety net):
-        If two identical requests slip through the pre-flight check within
-        the same millisecond, the PostgreSQL UNIQUE constraints on email
-        and phone_number will still reject the second write. The
-        IntegrityError is caught, the session is rolled back cleanly, and
-        a 409 is returned instead of a 500 crash.
+    Re-requesting for the same email atomically replaces the previous OTP
+    record, invalidating any code that was already sent.
     """
-    # ── Layer 1: pre-flight duplicate check (before any hashing) ─────────────
+    # Pre-flight: check existing accounts before any hashing
     await _check_conflicts(db, body.email, body.phone_number)
 
-    # ── Hash password (only reached if no duplicate was found) ────────────────
+    otp_code = f"{secrets.randbelow(10 ** 6):06d}"
     hashed_pw = hash_password(body.password)
+    expires_at = datetime.now(timezone.utc) + timedelta(minutes=OTP_EXPIRE_MINUTES)
+
+    # Atomic upsert: delete any stale OTP for this email then insert fresh one
+    await db.execute(
+        delete(OTPVerification).where(OTPVerification.email == body.email)
+    )
+    db.add(OTPVerification(
+        id=uuid.uuid4(),
+        email=body.email,
+        otp_code=otp_code,
+        hashed_password=hashed_pw,
+        phone_number=body.phone_number,
+        expires_at=expires_at,
+    ))
+    await db.commit()
+
+    background_tasks.add_task(send_otp_email, body.email, otp_code)
+    logger.info(f"[signup-request] OTP queued for {body.email}")
+
+    return {"message": "Verification code sent. Check your email."}
+
+
+# ─── POST /verify-otp ─────────────────────────────────────────────────────────
+
+@router.post(
+    "/verify-otp",
+    response_model=Token,
+    status_code=status.HTTP_201_CREATED,
+    summary="Verify OTP and create the permanent user account",
+)
+async def verify_otp(body: OTPVerify, db: AsyncSession = Depends(get_db)):
+    """
+    Step 2 of the two-step signup flow.
+
+    Looks up the OTP record by email, enforces expiry and attempt limits,
+    then atomically deletes the OTP record and creates the permanent User
+    row in a single transaction. Returns a JWT identical to /login so the
+    client can proceed directly to the dashboard.
+
+    Security properties:
+    - Max 5 wrong attempts before the OTP record is invalidated.
+    - 5-minute expiry window enforced server-side regardless of client state.
+    - Race-condition guard via _check_conflicts before final write.
+    - Distinct error messages for expired vs invalid so UX is clear,
+      but both cases require a new signup-request (no information leak
+      about whether the email was registered).
+    """
+    result = await db.execute(
+        select(OTPVerification).where(OTPVerification.email == body.email)
+    )
+    record: Optional[OTPVerification] = result.scalar_one_or_none()
+
+    if not record:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No pending verification found for this email. Please sign up again.",
+        )
+
+    # Normalise to UTC-aware before comparison
+    expires = record.expires_at
+    if expires.tzinfo is None:
+        expires = expires.replace(tzinfo=timezone.utc)
+
+    if expires < datetime.now(timezone.utc):
+        await db.delete(record)
+        await db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Verification code has expired. Please sign up again to receive a new code.",
+        )
+
+    if record.attempt_count >= OTP_MAX_ATTEMPTS:
+        await db.delete(record)
+        await db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Too many incorrect attempts. Please sign up again.",
+        )
+
+    if record.otp_code != body.otp_code:
+        record.attempt_count += 1
+        await db.commit()
+        remaining = OTP_MAX_ATTEMPTS - record.attempt_count
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Incorrect verification code. "
+                f"{remaining} attempt{'s' if remaining != 1 else ''} remaining."
+            ),
+        )
+
+    # OTP correct — final duplicate guard against race conditions
+    await _check_conflicts(db, record.email, record.phone_number)
 
     new_user = User(
         id=uuid.uuid4(),
-        email=body.email,
-        phone_number=body.phone_number,
-        hashed_password=hashed_pw,
+        email=record.email,
+        phone_number=record.phone_number,
+        hashed_password=record.hashed_password,
         credit_minutes=3,
     )
 
-    # ── Layer 2: DB-level uniqueness guard with safe rollback ─────────────────
     try:
         db.add(new_user)
+        await db.delete(record)
         await db.commit()
         await db.refresh(new_user)
     except IntegrityError as exc:
         await db.rollback()
-        logger.warning(
-            f"[signup] IntegrityError for email={body.email} "
-            f"phone={body.phone_number}: {exc.orig}"
-        )
-        # Parse the constraint name from the DETAIL string when possible
         detail_lower = str(exc.orig).lower()
-        if "phone_number" in detail_lower:
-            conflict_field = "phone number"
-        else:
-            conflict_field = "email address"
+        conflict_field = "phone number" if "phone_number" in detail_lower else "email address"
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=(
-                f"Registration failed — an account with this {conflict_field} "
-                "already exists. This may be a duplicate submission."
-            ),
+            detail=f"An account with this {conflict_field} already exists.",
         )
 
-    logger.info(f"[signup] user_id={new_user.id} email={new_user.email}")
+    logger.info(f"[verify-otp] created user_id={new_user.id} email={new_user.email}")
 
     return Token(
         access_token=create_access_token(str(new_user.id), new_user.email),
@@ -181,6 +259,8 @@ async def signup(body: UserCreate, db: AsyncSession = Depends(get_db)):
         email=new_user.email,
     )
 
+
+# ─── POST /login ──────────────────────────────────────────────────────────────
 
 @router.post(
     "/login",
@@ -190,10 +270,7 @@ async def signup(body: UserCreate, db: AsyncSession = Depends(get_db)):
 async def login(body: UserLogin, db: AsyncSession = Depends(get_db)):
     """
     Verifies email + bcrypt password, returns a signed JWT valid for 24 hours.
-    Pass it as `Authorization: Bearer <token>` on all protected endpoints.
-
-    Intentionally returns the same error message for both 'email not found'
-    and 'wrong password' to prevent user enumeration.
+    Same error for 'not found' and 'wrong password' to prevent enumeration.
     """
     result = await db.execute(select(User).where(User.email == body.email))
     user: Optional[User] = result.scalar_one_or_none()
@@ -212,6 +289,8 @@ async def login(body: UserLogin, db: AsyncSession = Depends(get_db)):
         email=user.email,
     )
 
+
+# ─── GET /me ──────────────────────────────────────────────────────────────────
 
 @router.get(
     "/me",

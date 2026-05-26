@@ -2,6 +2,50 @@ import re
 from typing import Optional
 from pydantic import BaseModel, EmailStr, field_validator
 
+# Domains that are either placeholder, disposable, or commonly abused in testing.
+# Checked on both signup and login so no blacklisted address can ever authenticate.
+_BLOCKED_DOMAINS: frozenset[str] = frozenset({
+    "example.com", "example.org", "example.net",
+    "test.com", "test.org", "test.net",
+    "mailinator.com", "guerrillamail.com", "guerrillamail.org",
+    "tempmail.com", "throwaway.email", "yopmail.com",
+    "sharklasers.com", "trashmail.com", "dispostable.com",
+    "xyz.com", "foo.com", "bar.com",
+})
+
+_TYPO_DOMAINS: dict[str, str] = {
+    "gamil.com": "gmail.com", "gmai.com": "gmail.com", "gmial.com": "gmail.com",
+    "gnail.com": "gmail.com", "gmal.com": "gmail.com", "gmail.co": "gmail.com",
+    "gmail.cm": "gmail.com", "gmil.com": "gmail.com", "gimail.com": "gmail.com",
+    "yahooo.com": "yahoo.com", "yaho.com": "yahoo.com", "yhoo.com": "yahoo.com",
+    "yhaoo.com": "yahoo.com", "yahoo.co": "yahoo.com",
+    "hotmial.com": "hotmail.com", "hotmaill.com": "hotmail.com", "hotmal.com": "hotmail.com",
+    "hotmai.com": "hotmail.com",
+    "outlok.com": "outlook.com", "outloo.com": "outlook.com", "outlook.co": "outlook.com",
+}
+
+_EMAIL_RE = re.compile(
+    r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$"
+)
+
+
+def _validate_email_domain(email: str) -> str:
+    """Shared logic used by both UserCreate and UserLogin validators."""
+    email = email.strip().lower()
+    if not _EMAIL_RE.match(email):
+        raise ValueError(
+            "Enter a valid email address (e.g. name@domain.com)."
+        )
+    domain = email.split("@", 1)[1]
+    if domain in _BLOCKED_DOMAINS:
+        raise ValueError("This email domain is not permitted.")
+    suggestion = _TYPO_DOMAINS.get(domain)
+    if suggestion:
+        raise ValueError(
+            f"Did you mean @{suggestion}? Please check your email address."
+        )
+    return email
+
 
 # ─── Auth ─────────────────────────────────────────────────────────────────────
 
@@ -13,12 +57,7 @@ class UserCreate(BaseModel):
     @field_validator("email", mode="before")
     @classmethod
     def normalize_email(cls, v: str) -> str:
-        """
-        Lowercases and strips the email before any uniqueness check or
-        persistence, so 'User@Email.COM' and 'user@email.com' are treated
-        as the same address at every layer of the stack.
-        """
-        return v.strip().lower()
+        return _validate_email_domain(v)
 
     @field_validator("password")
     @classmethod
@@ -61,7 +100,7 @@ class UserLogin(BaseModel):
     @field_validator("email", mode="before")
     @classmethod
     def normalize_email(cls, v: str) -> str:
-        return v.strip().lower()
+        return _validate_email_domain(v)
 
 
 class Token(BaseModel):
@@ -88,6 +127,19 @@ class ProjectUploadResponse(BaseModel):
     title: str
     local_path: str
     message: str
+
+
+class ProjectHistoryItem(BaseModel):
+    project_id: str
+    title: str
+    created_at: Optional[str] = None
+    latest_job_id: Optional[str] = None
+    latest_job_status: Optional[str] = None
+    latest_job_language: Optional[str] = None
+    output_video_path: Optional[str] = None
+
+    class Config:
+        from_attributes = True
 
 
 # ─── Render Jobs ──────────────────────────────────────────────────────────────
@@ -120,6 +172,24 @@ class VideoProcess(BaseModel):
                 f"'{v}' is not supported by ElevenLabs Dubbing. "
                 f"Supported codes: {supported}"
             )
+        return v
+
+
+class OTPVerify(BaseModel):
+    email: EmailStr
+    otp_code: str
+
+    @field_validator("email", mode="before")
+    @classmethod
+    def normalize_email(cls, v: str) -> str:
+        return _validate_email_domain(v)
+
+    @field_validator("otp_code")
+    @classmethod
+    def validate_otp_code(cls, v: str) -> str:
+        v = v.strip()
+        if not re.fullmatch(r"\d{6}", v):
+            raise ValueError("OTP must be exactly 6 digits.")
         return v
 
 

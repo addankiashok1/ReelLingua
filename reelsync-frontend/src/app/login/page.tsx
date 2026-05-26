@@ -6,6 +6,36 @@ import Link from 'next/link'
 import axios from 'axios'
 import api from '@/utils/api'
 
+const _BLOCKED_DOMAINS = new Set([
+  'example.com', 'example.org', 'example.net',
+  'test.com', 'test.org', 'test.net',
+  'mailinator.com', 'guerrillamail.com', 'guerrillamail.org',
+  'tempmail.com', 'throwaway.email', 'yopmail.com',
+  'sharklasers.com', 'trashmail.com', 'dispostable.com',
+  'xyz.com', 'foo.com', 'bar.com',
+])
+const _TYPO_DOMAINS: Record<string, string> = {
+  'gamil.com': 'gmail.com', 'gmai.com': 'gmail.com', 'gmial.com': 'gmail.com',
+  'gnail.com': 'gmail.com', 'gmal.com': 'gmail.com', 'gmail.co': 'gmail.com',
+  'gmail.cm': 'gmail.com', 'gmil.com': 'gmail.com', 'gimail.com': 'gmail.com',
+  'yahooo.com': 'yahoo.com', 'yaho.com': 'yahoo.com', 'yhoo.com': 'yahoo.com',
+  'yhaoo.com': 'yahoo.com', 'yahoo.co': 'yahoo.com',
+  'hotmial.com': 'hotmail.com', 'hotmaill.com': 'hotmail.com', 'hotmal.com': 'hotmail.com',
+  'hotmai.com': 'hotmail.com',
+  'outlok.com': 'outlook.com', 'outloo.com': 'outlook.com', 'outlook.co': 'outlook.com',
+}
+const _EMAIL_RE = /^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$/
+
+function validateEmail(email: string): string | null {
+  const normalized = email.trim().toLowerCase()
+  if (!_EMAIL_RE.test(normalized)) return 'Enter a valid email address (e.g. name@domain.com).'
+  const domain = normalized.split('@')[1]
+  if (_BLOCKED_DOMAINS.has(domain)) return 'Please enter a valid, permanent email address.'
+  const suggestion = _TYPO_DOMAINS[domain]
+  if (suggestion) return `Did you mean @${suggestion}? Please check your email address.`
+  return null
+}
+
 export default function LoginPage() {
   const router = useRouter()
   const [email, setEmail] = useState('')
@@ -16,6 +46,13 @@ export default function LoginPage() {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
     setError('')
+
+    const emailError = validateEmail(email)
+    if (emailError) {
+      setError(emailError)
+      return
+    }
+
     setLoading(true)
     try {
       const { data } = await api.post('/api/auth/login', { email, password })

@@ -19,6 +19,10 @@ class Settings(BaseSettings):
     phonepe_salt_key: str = ""
     phonepe_salt_index: int = 1
 
+    # Phase 4 — Gmail SMTP for OTP emails
+    smtp_user: str = ""
+    smtp_password: str = ""
+
     model_config = SettingsConfigDict(
         # Check reelsync-backend/.env first, fall back to repo root .env
         env_file=(

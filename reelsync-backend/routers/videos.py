@@ -1,7 +1,7 @@
 import logging
 import os
 import uuid
-from typing import Optional
+from typing import List, Optional
 
 from fastapi import (
     APIRouter,
@@ -23,6 +23,7 @@ from models.db_models import Project, RenderJob, User
 from models.schemas import (
     JobStatusResponse,
     ProcessResponse,
+    ProjectHistoryItem,
     ProjectUploadResponse,
     VideoProcess,
 )
@@ -34,6 +35,53 @@ router = APIRouter()
 ALLOWED_MIME_TYPES = {"video/mp4", "video/quicktime", "video/x-matroska", "video/avi"}
 INPUT_DIR = os.path.join(STORAGE_DIR, "inputs")
 OUTPUT_DIR = os.path.join(STORAGE_DIR, "outputs")
+
+
+# ─── GET /history ─────────────────────────────────────────────────────────────
+
+@router.get(
+    "/history",
+    response_model=List[ProjectHistoryItem],
+    summary="List all video projects for the authenticated user",
+)
+async def get_history(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Returns all projects owned by the current user, newest first.
+    Enforces row-level isolation via Project.user_id == current_user.id.
+    A user can never retrieve another user's project rows regardless of
+    whether they know the project_id.
+    """
+    result = await db.execute(
+        select(Project)
+        .where(Project.user_id == current_user.id)
+        .order_by(Project.created_at.desc())
+    )
+    projects = result.scalars().all()
+
+    history: List[ProjectHistoryItem] = []
+    for project in projects:
+        job_result = await db.execute(
+            select(RenderJob)
+            .where(RenderJob.project_id == project.id)
+            .order_by(RenderJob.created_at.desc())
+            .limit(1)
+        )
+        latest_job: Optional[RenderJob] = job_result.scalar_one_or_none()
+
+        history.append(ProjectHistoryItem(
+            project_id=str(project.id),
+            title=project.title,
+            created_at=str(project.created_at),
+            latest_job_id=str(latest_job.id) if latest_job else None,
+            latest_job_status=latest_job.status if latest_job else None,
+            latest_job_language=latest_job.target_language if latest_job else None,
+            output_video_path=latest_job.output_video_path if latest_job else None,
+        ))
+
+    return history
 
 
 # ─── POST /upload ─────────────────────────────────────────────────────────────
@@ -50,10 +98,6 @@ async def upload_video(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """
-    Saves the uploaded MP4 to `local_storage/inputs/{user_id}/{file_id}_{filename}`,
-    creates a `projects` row via SQLAlchemy, and returns the new project ID.
-    """
     if file.content_type not in ALLOWED_MIME_TYPES:
         raise HTTPException(
             status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
@@ -67,7 +111,7 @@ async def upload_video(
     file_uid = uuid.uuid4().hex
     safe_name = (file.filename or "upload.mp4").replace(" ", "_")
 
-    # User-isolated subfolder prevents one user from guessing another's paths
+    # User-isolated subfolder — prevents cross-account path collisions
     user_input_dir = os.path.join(INPUT_DIR, user_id)
     os.makedirs(user_input_dir, exist_ok=True)
 
@@ -121,14 +165,10 @@ async def process_video(
     current_user: User = Depends(get_current_user),
 ):
     """
-    Verifies project ownership, checks credit balance, creates a `render_jobs`
-    row in PENDING state, and returns immediately.
-
-    The full ElevenLabs + MoviePy pipeline runs asynchronously.
-    Poll `GET /api/videos/jobs/{job_id}` to track live status.
-    One credit minute is deducted when the job reaches COMPLETED.
+    Ownership enforced by filtering on both project_id AND current_user.id.
+    A valid project_id belonging to another user returns 404 — indistinguishable
+    from a non-existent project, preventing enumeration attacks.
     """
-    # ── Verify project ownership ──────────────────────────────────────────────
     result = await db.execute(
         select(Project)
         .where(Project.id == uuid.UUID(project_id))
@@ -142,7 +182,6 @@ async def process_video(
             detail=f"Project '{project_id}' not found or does not belong to you.",
         )
 
-    # ── Credit check ─────────────────────────────────────────────────────────
     if current_user.credit_minutes < 1:
         raise HTTPException(
             status_code=status.HTTP_402_PAYMENT_REQUIRED,
@@ -152,7 +191,6 @@ async def process_video(
             ),
         )
 
-    # ── Create render job row ─────────────────────────────────────────────────
     job = RenderJob(
         id=uuid.uuid4(),
         project_id=project.id,
@@ -168,7 +206,6 @@ async def process_video(
         f"user_id={current_user.id} lang={body.target_language}"
     )
 
-    # ── Fire background task ──────────────────────────────────────────────────
     background_tasks.add_task(
         run_background_job,
         job_id=str(job.id),
@@ -183,9 +220,7 @@ async def process_video(
         project_id=str(project.id),
         target_language=body.target_language,
         status="PENDING",
-        message=(
-            f"Render job queued. Poll GET /api/videos/jobs/{job.id} for live status."
-        ),
+        message=f"Render job queued. Poll GET /api/videos/jobs/{job.id} for live status.",
     )
 
 
@@ -201,10 +236,6 @@ async def get_job_status(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """
-    Returns current status of a render job.
-    When COMPLETED, `output_video_path` holds the local path to the finished MP4.
-    """
     result = await db.execute(
         select(RenderJob).where(RenderJob.id == uuid.UUID(job_id))
     )
@@ -216,7 +247,7 @@ async def get_job_status(
             detail=f"Render job '{job_id}' not found.",
         )
 
-    # Verify ownership via parent project
+    # Ownership verified through the parent project row
     proj_result = await db.execute(
         select(Project)
         .where(Project.id == job.project_id)

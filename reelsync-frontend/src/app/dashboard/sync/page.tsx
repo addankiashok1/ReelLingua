@@ -132,9 +132,9 @@ export default function SyncPage() {
         if (data.status === 'COMPLETED') {
           clearInterval(pollRef.current!)
           const path = data.output_video_path ?? ''
-          const parts = path.replace(/\\/g, '/').split('/')
-          const relPath = parts.slice(-2).join('/')
-          setVideoUrl(`http://localhost:8000/downloads/${relPath}`)
+          const filename = path.replace(/\\/g, '/').split('/').pop() ?? ''
+          const token = encodeURIComponent(localStorage.getItem('access_token') ?? '')
+          setVideoUrl(`http://localhost:8000/downloads/${filename}?token=${token}`)
           setStep('done')
         } else if (data.status === 'FAILED') {
           clearInterval(pollRef.current!)

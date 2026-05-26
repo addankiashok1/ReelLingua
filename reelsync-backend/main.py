@@ -1,15 +1,20 @@
 import logging
 import os
+import uuid
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+from jose import JWTError, jwt
 from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
 
 import config
-from database import engine
-from models.db_models import Base
+from config import settings
+from database import engine, get_db
+from models.db_models import Base, OTPVerification, User  # noqa: F401 — registers models with Base
 from routers import auth, payments, videos
+from routers.auth import ALGORITHM
 
 logging.basicConfig(
     level=logging.INFO,
@@ -17,7 +22,6 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 
-# Ensure local working directories exist before the server accepts requests
 os.makedirs(config.TEMP_DIR, exist_ok=True)
 os.makedirs(os.path.join(config.STORAGE_DIR, "inputs"), exist_ok=True)
 os.makedirs(os.path.join(config.STORAGE_DIR, "outputs"), exist_ok=True)
@@ -47,10 +51,69 @@ app.include_router(auth.router,     prefix="/api/auth",     tags=["Authenticatio
 app.include_router(videos.router,   prefix="/api/videos",   tags=["Videos"])
 app.include_router(payments.router, prefix="/api/payments", tags=["Payments"])
 
-# Serve processed videos directly from local_storage/outputs/
-# e.g. GET http://localhost:8000/downloads/processed_reel.mp4
-_outputs_dir = os.path.join(config.STORAGE_DIR, "outputs")
-app.mount("/downloads", StaticFiles(directory=_outputs_dir), name="downloads")
+
+# ─── Authenticated video download ─────────────────────────────────────────────
+# Replaces the open StaticFiles mount. Verifies the JWT token passed as a
+# query parameter, then serves the file exclusively from the requesting user's
+# own output directory. A user cannot access another user's output even if they
+# know the exact filename.
+
+@app.get("/downloads/{filename}", tags=["Downloads"])
+async def download_video(
+    filename: str,
+    token: str = Query(..., description="JWT access token"),
+    db: AsyncSession = Depends(get_db),
+):
+    # ── Validate JWT ─────────────────────────────────────────────────────────
+    try:
+        payload = jwt.decode(token, settings.jwt_secret_key, algorithms=[ALGORITHM])
+        user_id_str: str = payload.get("sub", "")
+        if not user_id_str:
+            raise JWTError("Missing subject")
+    except JWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired token.",
+        )
+
+    # ── Resolve user ──────────────────────────────────────────────────────────
+    try:
+        user_uuid = uuid.UUID(user_id_str)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Malformed token subject.",
+        )
+
+    user: User | None = await db.get(User, user_uuid)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User no longer exists.",
+        )
+
+    # ── Serve only from the user's own output directory ───────────────────────
+    # Path traversal guard: reject any filename containing directory separators
+    if os.sep in filename or "/" in filename or "\\" in filename:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid filename.",
+        )
+
+    file_path = os.path.join(config.STORAGE_DIR, "outputs", str(user.id), filename)
+
+    if not os.path.isfile(file_path):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="File not found.",
+        )
+
+    logger.info(f"[download] user={user.id} file={filename}")
+    return FileResponse(
+        file_path,
+        media_type="video/mp4",
+        filename=filename,
+    )
 
 
 @app.on_event("startup")
@@ -69,3 +132,6 @@ async def create_tables() -> None:
 @app.get("/health", tags=["Health"])
 def health():
     return {"status": "ok", "service": "ReelSync AI", "version": "2.0.0"}
+
+
+logger = logging.getLogger(__name__)
