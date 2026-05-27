@@ -174,8 +174,10 @@ class RenderJob(Base):
         nullable=False,
         index=True,
     )
+    scene_name = Column(String(255), nullable=True)        # user-defined clip/scene label
     target_language = Column(String(10), nullable=False)
     subtitle_language = Column(String(10), nullable=True)
+    source_language = Column(String(10), nullable=True)   # "auto" or BCP-47 code
     status = Column(String(30), nullable=False, default="PENDING")
     progress_percentage = Column(Integer, nullable=False, default=0, server_default="0")
     output_video_path = Column(String, nullable=True)

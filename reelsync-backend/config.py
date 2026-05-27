@@ -57,3 +57,9 @@ settings = Settings()
 ELEVENLABS_API_KEY: str = settings.elevenlabs_api_key
 TEMP_DIR: str = os.path.join(os.path.dirname(__file__), "temp_outputs")
 STORAGE_DIR: str = os.path.join(os.path.dirname(__file__), "local_storage")
+
+# Maximum number of render jobs that may execute concurrently.
+# Each job ties up one ElevenLabs API call + one MoviePy thread, so keep this
+# conservative relative to your CPU count and ElevenLabs rate limits.
+# Override by setting MAX_CONCURRENT_JOBS in the environment or .env file.
+MAX_CONCURRENT_JOBS: int = int(os.getenv("MAX_CONCURRENT_JOBS", "3"))

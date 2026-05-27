@@ -23,43 +23,44 @@ class AIOrchestrator:
         video_path: str,
         target_lang: str,
         output_dir: str,
-    ) -> tuple[str, list[dict]]:
+        source_lang: str = "auto",
+    ) -> tuple[str, list[dict], str]:
         """
         Submits video to ElevenLabs Dubbing API, waits for completion,
         then downloads the dubbed MP3 and SRT transcript.
 
-        Subtitle cross-language translation is handled at the pipeline layer
-        (core/subtitle_translator.py), not here.  This method always downloads
-        the SRT in target_lang and returns a 2-tuple.
-
         Returns
         -------
-        (dubbed_audio_path, subtitles_data)
-            subtitles_data — list of dicts: {index, start, end, text}
-            SRT file is also saved to output_dir/subtitles_{target_lang}.srt
-            for the pipeline's translation step to consume.
+        (dubbed_audio_path, subtitles_data, detected_source_lang)
+            detected_source_lang — BCP-47 code ElevenLabs detected, or "" if unknown.
         """
         logger.info("Submitting video to ElevenLabs Dubbing API...")
 
         with open(video_path, "rb") as f:
-            response = self.client.dubbing.dub_a_video_or_an_audio_file(
-                file=(Path(video_path).name, f, "video/mp4"),
-                target_lang=target_lang,
-                mode="automatic",
-                watermark=True,
-            )
+            kwargs: dict = {
+                "file": (Path(video_path).name, f, "video/mp4"),
+                "target_lang": target_lang,
+                "mode": "automatic",
+                "watermark": True,
+            }
+            if source_lang and source_lang != "auto":
+                kwargs["source_lang"] = source_lang
+            response = self.client.dubbing.dub_a_video_or_an_audio_file(**kwargs)
 
         dubbing_id = response.dubbing_id
         logger.info(f"Dubbing job created. ID: {dubbing_id}")
 
-        self._wait_for_completion(dubbing_id)
+        final_metadata     = self._wait_for_completion(dubbing_id)
+        detected_src_lang  = self._extract_source_language(final_metadata)
+        logger.info(f"Detected source language: {detected_src_lang or '(unknown)'}")
 
         audio_path     = self._download_dubbed_audio(dubbing_id, target_lang, output_dir)
         subtitles_data = self._download_subtitles(dubbing_id, target_lang, output_dir)
 
-        return audio_path, subtitles_data
+        return audio_path, subtitles_data, detected_src_lang
 
-    def _wait_for_completion(self, dubbing_id: str) -> None:
+    def _wait_for_completion(self, dubbing_id: str):
+        """Polls until dubbed; returns the final metadata object."""
         elapsed = 0
         while elapsed < MAX_WAIT_SECONDS:
             metadata = self.client.dubbing.get_dubbing_project_metadata(
@@ -70,7 +71,7 @@ class AIOrchestrator:
 
             if status == "dubbed":
                 logger.info("Dubbing complete.")
-                return
+                return metadata
             if status == "failed":
                 raise RuntimeError(
                     f"ElevenLabs dubbing job {dubbing_id} failed on the server."
@@ -82,6 +83,31 @@ class AIOrchestrator:
         raise TimeoutError(
             f"Dubbing job {dubbing_id} did not complete within {MAX_WAIT_SECONDS}s."
         )
+
+    def _extract_source_language(self, metadata) -> str:
+        """
+        Reads the auto-detected source language from ElevenLabs metadata.
+        The SDK type stubs may not expose every field, so we probe several
+        attribute names and fall back to model_dump() for extra fields.
+        """
+        for attr in ("source_languages", "source_lang", "source_language"):
+            val = getattr(metadata, attr, None)
+            if val:
+                return (val[0] if isinstance(val, list) else str(val)).lower()
+        # Pydantic v2 model_dump / v1 dict() expose fields not in the type stubs
+        try:
+            raw: dict = (
+                metadata.model_dump()
+                if hasattr(metadata, "model_dump")
+                else vars(metadata)
+            )
+            for key in ("source_languages", "source_lang", "source_language"):
+                val = raw.get(key)
+                if val:
+                    return (val[0] if isinstance(val, list) else str(val)).lower()
+        except Exception:
+            pass
+        return ""
 
     def _download_dubbed_audio(
         self, dubbing_id: str, language_code: str, output_dir: str

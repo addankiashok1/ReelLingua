@@ -59,8 +59,143 @@ const LANGUAGES = [
 
 const LANG_LABEL: Record<string, string> = Object.fromEntries(LANGUAGES.map(l => [l.code, l.label]))
 
-// Subtitle language options — same comprehensive set as voice languages
-const SUBTITLE_LANGUAGES = LANGUAGES
+// Subtitle language options — exact codes accepted by deep-translator (GoogleTranslator)
+const SUBTITLE_LANGUAGES = [
+  { code: 'af',        label: 'Afrikaans' },
+  { code: 'sq',        label: 'Albanian' },
+  { code: 'am',        label: 'Amharic' },
+  { code: 'ar',        label: 'Arabic' },
+  { code: 'hy',        label: 'Armenian' },
+  { code: 'as',        label: 'Assamese' },
+  { code: 'ay',        label: 'Aymara' },
+  { code: 'az',        label: 'Azerbaijani' },
+  { code: 'bm',        label: 'Bambara' },
+  { code: 'eu',        label: 'Basque' },
+  { code: 'be',        label: 'Belarusian' },
+  { code: 'bn',        label: 'Bengali' },
+  { code: 'bho',       label: 'Bhojpuri' },
+  { code: 'bs',        label: 'Bosnian' },
+  { code: 'bg',        label: 'Bulgarian' },
+  { code: 'ca',        label: 'Catalan' },
+  { code: 'ceb',       label: 'Cebuano' },
+  { code: 'ny',        label: 'Chichewa' },
+  { code: 'zh-CN',     label: 'Chinese (Simplified)' },
+  { code: 'zh-TW',     label: 'Chinese (Traditional)' },
+  { code: 'co',        label: 'Corsican' },
+  { code: 'hr',        label: 'Croatian' },
+  { code: 'cs',        label: 'Czech' },
+  { code: 'da',        label: 'Danish' },
+  { code: 'dv',        label: 'Dhivehi' },
+  { code: 'doi',       label: 'Dogri' },
+  { code: 'nl',        label: 'Dutch' },
+  { code: 'en',        label: 'English' },
+  { code: 'eo',        label: 'Esperanto' },
+  { code: 'et',        label: 'Estonian' },
+  { code: 'ee',        label: 'Ewe' },
+  { code: 'tl',        label: 'Filipino' },
+  { code: 'fi',        label: 'Finnish' },
+  { code: 'fr',        label: 'French' },
+  { code: 'fy',        label: 'Frisian' },
+  { code: 'gl',        label: 'Galician' },
+  { code: 'ka',        label: 'Georgian' },
+  { code: 'de',        label: 'German' },
+  { code: 'el',        label: 'Greek' },
+  { code: 'gn',        label: 'Guarani' },
+  { code: 'gu',        label: 'Gujarati' },
+  { code: 'ht',        label: 'Haitian Creole' },
+  { code: 'ha',        label: 'Hausa' },
+  { code: 'haw',       label: 'Hawaiian' },
+  { code: 'iw',        label: 'Hebrew' },
+  { code: 'hi',        label: 'Hindi' },
+  { code: 'hmn',       label: 'Hmong' },
+  { code: 'hu',        label: 'Hungarian' },
+  { code: 'is',        label: 'Icelandic' },
+  { code: 'ig',        label: 'Igbo' },
+  { code: 'ilo',       label: 'Ilocano' },
+  { code: 'id',        label: 'Indonesian' },
+  { code: 'ga',        label: 'Irish' },
+  { code: 'it',        label: 'Italian' },
+  { code: 'ja',        label: 'Japanese' },
+  { code: 'jw',        label: 'Javanese' },
+  { code: 'kn',        label: 'Kannada' },
+  { code: 'kk',        label: 'Kazakh' },
+  { code: 'km',        label: 'Khmer' },
+  { code: 'rw',        label: 'Kinyarwanda' },
+  { code: 'gom',       label: 'Konkani' },
+  { code: 'ko',        label: 'Korean' },
+  { code: 'kri',       label: 'Krio' },
+  { code: 'ku',        label: 'Kurdish (Kurmanji)' },
+  { code: 'ckb',       label: 'Kurdish (Sorani)' },
+  { code: 'ky',        label: 'Kyrgyz' },
+  { code: 'lo',        label: 'Lao' },
+  { code: 'la',        label: 'Latin' },
+  { code: 'lv',        label: 'Latvian' },
+  { code: 'ln',        label: 'Lingala' },
+  { code: 'lt',        label: 'Lithuanian' },
+  { code: 'lg',        label: 'Luganda' },
+  { code: 'lb',        label: 'Luxembourgish' },
+  { code: 'mk',        label: 'Macedonian' },
+  { code: 'mai',       label: 'Maithili' },
+  { code: 'mg',        label: 'Malagasy' },
+  { code: 'ms',        label: 'Malay' },
+  { code: 'ml',        label: 'Malayalam' },
+  { code: 'mt',        label: 'Maltese' },
+  { code: 'mi',        label: 'Maori' },
+  { code: 'mr',        label: 'Marathi' },
+  { code: 'mni-Mtei',  label: 'Meiteilon (Manipuri)' },
+  { code: 'lus',       label: 'Mizo' },
+  { code: 'mn',        label: 'Mongolian' },
+  { code: 'my',        label: 'Myanmar' },
+  { code: 'ne',        label: 'Nepali' },
+  { code: 'no',        label: 'Norwegian' },
+  { code: 'or',        label: 'Odia (Oriya)' },
+  { code: 'om',        label: 'Oromo' },
+  { code: 'ps',        label: 'Pashto' },
+  { code: 'fa',        label: 'Persian' },
+  { code: 'pl',        label: 'Polish' },
+  { code: 'pt',        label: 'Portuguese' },
+  { code: 'pa',        label: 'Punjabi' },
+  { code: 'qu',        label: 'Quechua' },
+  { code: 'ro',        label: 'Romanian' },
+  { code: 'ru',        label: 'Russian' },
+  { code: 'sm',        label: 'Samoan' },
+  { code: 'sa',        label: 'Sanskrit' },
+  { code: 'gd',        label: 'Scots Gaelic' },
+  { code: 'nso',       label: 'Sepedi' },
+  { code: 'sr',        label: 'Serbian' },
+  { code: 'st',        label: 'Sesotho' },
+  { code: 'sn',        label: 'Shona' },
+  { code: 'sd',        label: 'Sindhi' },
+  { code: 'si',        label: 'Sinhala' },
+  { code: 'sk',        label: 'Slovak' },
+  { code: 'sl',        label: 'Slovenian' },
+  { code: 'so',        label: 'Somali' },
+  { code: 'es',        label: 'Spanish' },
+  { code: 'su',        label: 'Sundanese' },
+  { code: 'sw',        label: 'Swahili' },
+  { code: 'sv',        label: 'Swedish' },
+  { code: 'tg',        label: 'Tajik' },
+  { code: 'ta',        label: 'Tamil' },
+  { code: 'tt',        label: 'Tatar' },
+  { code: 'te',        label: 'Telugu' },
+  { code: 'th',        label: 'Thai' },
+  { code: 'ti',        label: 'Tigrinya' },
+  { code: 'ts',        label: 'Tsonga' },
+  { code: 'tr',        label: 'Turkish' },
+  { code: 'tk',        label: 'Turkmen' },
+  { code: 'ak',        label: 'Twi' },
+  { code: 'uk',        label: 'Ukrainian' },
+  { code: 'ur',        label: 'Urdu' },
+  { code: 'ug',        label: 'Uyghur' },
+  { code: 'uz',        label: 'Uzbek' },
+  { code: 'vi',        label: 'Vietnamese' },
+  { code: 'cy',        label: 'Welsh' },
+  { code: 'xh',        label: 'Xhosa' },
+  { code: 'yi',        label: 'Yiddish' },
+  { code: 'yo',        label: 'Yoruba' },
+  { code: 'zu',        label: 'Zulu' },
+]
+const SUBTITLE_LANG_LABEL: Record<string, string> = Object.fromEntries(SUBTITLE_LANGUAGES.map(l => [l.code, l.label]))
 
 const PLAN_META: Record<string, {
   label:       string
@@ -119,11 +254,15 @@ interface UserProfile {
 interface ProjectHistoryItem {
   project_id: string
   title: string
-  created_at: string | null
+  created_at: string | null             // project upload date
   latest_job_id: string | null
   latest_job_status: string | null
   latest_job_language: string | null
   latest_job_subtitle_language: string | null
+  latest_job_source_language: string | null
+  latest_job_scene_name: string | null
+  latest_job_created_at: string | null  // when the latest job was queued
+  latest_job_updated_at: string | null  // last status change
   output_video_path: string | null
   progress_percentage: number | null
 }
@@ -353,9 +492,10 @@ export default function DashboardPage() {
   const [dateFilter,        setDateFilter]        = useState('all')
   const [sortField,         setSortField]         = useState('created_at')
   const [sortDir,           setSortDir]           = useState<'asc' | 'desc'>('desc')
-  const [reworkTarget,      setReworkTarget]      = useState<{ project_id: string; title: string } | null>(null)
+  const [reworkTarget,      setReworkTarget]      = useState<{ project_id: string; title: string; scene_name?: string } | null>(null)
   const [reworkVoiceLang,   setReworkVoiceLang]   = useState('hi')
   const [reworkSubLang,     setReworkSubLang]     = useState('en')
+  const [reworkSceneName,   setReworkSceneName]   = useState('')
   const [reworking,         setReworking]         = useState(false)
   const [reworkError,       setReworkError]       = useState('')
 
@@ -441,12 +581,20 @@ export default function DashboardPage() {
     setReworking(true)
     setReworkError('')
     try {
-      await api.post(`/api/videos/process/${reworkTarget.project_id}`, {
-        target_voice_language:    reworkVoiceLang,
-        target_subtitle_language: reworkSubLang,
-      })
+      const res = await api.post<{ new_project_title?: string }>(
+        `/api/videos/rework/${reworkTarget.project_id}`,
+        {
+          scene_name:               reworkSceneName.trim() || null,
+          target_voice_language:    reworkVoiceLang,
+          target_subtitle_language: reworkSubLang,
+          source_language:          'auto',
+        },
+      )
       setReworkTarget(null)
+      setReworkSceneName('')
       await refreshProjects()
+      // Brief toast-like feedback via page error slot (green override not wired, so silent)
+      void res.data.new_project_title  // consumed to avoid lint warning
     } catch (err) {
       const detail = axios.isAxiosError(err)
         ? (err.response?.data?.detail ?? 'Failed to queue job. Check your credits.')
@@ -701,20 +849,38 @@ export default function DashboardPage() {
               </svg>
             </div>
             <div className="flex-1 min-w-0">
-              <h3 className="text-sm font-bold text-white">Rework Project</h3>
-              <p className="text-xs text-slate-400 mt-1 truncate">
+              <h3 className="text-sm font-bold text-white">Create New Version</h3>
+              <p className="text-xs text-slate-400 mt-1">
+                A new project will be created from{' '}
                 <span className="text-slate-200 font-medium">"{reworkTarget.title}"</span>
-                {' '}— reuses the uploaded video, no re-upload needed.
+                {' '}— the original is kept intact.
               </p>
             </div>
             <button
-              onClick={() => { setReworkTarget(null); setReworkError('') }}
+              onClick={() => { setReworkTarget(null); setReworkError(''); setReworkSceneName('') }}
               className="text-slate-500 hover:text-slate-300 transition-colors flex-shrink-0"
             >
               <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
                 <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
               </svg>
             </button>
+          </div>
+
+          {/* New project name */}
+          <div className="mb-4">
+            <label className="block text-[10px] font-semibold text-slate-500 uppercase tracking-widest mb-2">
+              New Project Name
+              <span className="ml-2 normal-case font-normal text-slate-600">(leave blank to auto-version)</span>
+            </label>
+            <input
+              type="text"
+              value={reworkSceneName}
+              onChange={e => setReworkSceneName(e.target.value)}
+              maxLength={80}
+              disabled={reworking}
+              placeholder={`e.g. Climax Scene  (blank → "${reworkTarget.title} v2")`}
+              className="w-full bg-slate-800 border border-slate-700/80 rounded-xl px-3 py-2.5 text-sm text-white placeholder-slate-600 focus:outline-none focus:ring-2 focus:ring-indigo-500/40 disabled:opacity-40"
+            />
           </div>
 
           {/* Language selectors */}
@@ -773,7 +939,7 @@ export default function DashboardPage() {
             </div>
             <div>
               <p className="text-[10px] text-slate-500 uppercase tracking-widest">Subtitles</p>
-              <p className="text-xs font-bold text-purple-300 mt-0.5">{SUBTITLE_LANGUAGES.find(l => l.code === reworkSubLang)?.label ?? reworkSubLang}</p>
+              <p className="text-xs font-bold text-purple-300 mt-0.5">{SUBTITLE_LANG_LABEL[reworkSubLang] ?? reworkSubLang}</p>
             </div>
             <div>
               <p className="text-[10px] text-slate-500 uppercase tracking-widest">Cost</p>
@@ -1273,7 +1439,7 @@ export default function DashboardPage() {
               <div className="flex items-center justify-between text-xs">
                 <span className="text-slate-500">Subtitles in</span>
                 <span className="font-semibold text-purple-400">
-                  {SUBTITLE_LANGUAGES.find(l => l.code === subtitleLanguage)?.label ?? subtitleLanguage}
+                  {SUBTITLE_LANG_LABEL[subtitleLanguage] ?? subtitleLanguage}
                 </span>
               </div>
             </div>
@@ -1499,9 +1665,12 @@ export default function DashboardPage() {
                       <SortIcon field="title" sortField={sortField} sortDir={sortDir} />
                     </button>
                   </th>
+                  <th className="text-left px-4 py-3.5 hidden md:table-cell">
+                    <span className="text-[10px] font-semibold text-slate-600 uppercase tracking-widest">Original</span>
+                  </th>
                   <th className="text-left px-4 py-3.5 hidden sm:table-cell">
                     <button onClick={() => handleSort('language')} className="group flex items-center gap-1.5 text-[10px] font-semibold text-slate-600 hover:text-slate-400 uppercase tracking-widest transition-colors">
-                      Language
+                      Dubbed
                       <SortIcon field="language" sortField={sortField} sortDir={sortDir} />
                     </button>
                   </th>
@@ -1548,20 +1717,32 @@ export default function DashboardPage() {
                         </div>
                       </td>
 
-                      {/* Title + short ID */}
-                      <td className="px-4 py-4 max-w-[180px]">
+                      {/* Title + scene name + short ID */}
+                      <td className="px-4 py-4 max-w-[200px]">
                         <p className="text-sm font-medium text-slate-200 truncate">{p.title || 'Untitled Project'}</p>
+                        {p.latest_job_scene_name && (
+                          <p className="text-[11px] text-indigo-400 mt-0.5 truncate font-medium">🎬 {p.latest_job_scene_name}</p>
+                        )}
                         <p className="text-[10px] text-slate-600 mt-0.5 font-mono">{p.project_id.slice(0, 8)}…</p>
                       </td>
 
-                      {/* Language badge */}
+                      {/* Original (source) language */}
+                      <td className="px-4 py-4 hidden md:table-cell">
+                        {p.latest_job_source_language ? (
+                          <span className="inline-flex items-center text-xs font-semibold px-2.5 py-1 rounded-full bg-slate-800/60 border border-slate-700/50 text-slate-300">
+                            {p.latest_job_source_language === 'auto'
+                              ? <span className="italic text-slate-500">Auto</span>
+                              : p.latest_job_source_language.toUpperCase()}
+                          </span>
+                        ) : (
+                          <span className="text-slate-700 text-xs">—</span>
+                        )}
+                      </td>
+
+                      {/* Dubbed language badge */}
                       <td className="px-4 py-4 hidden sm:table-cell">
                         {p.latest_job_language ? (
                           <span className="inline-flex items-center gap-1.5 text-xs font-semibold px-2.5 py-1 rounded-full bg-indigo-950/60 border border-indigo-900/50 text-indigo-300">
-                            <span className="text-slate-600 text-[10px] font-mono">SRC</span>
-                            <svg className="w-3 h-3 text-indigo-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
-                              <path strokeLinecap="round" strokeLinejoin="round" d="M13 7l5 5m0 0l-5 5m5-5H6" />
-                            </svg>
                             <span className="font-bold">{p.latest_job_language.toUpperCase()}</span>
                           </span>
                         ) : (
@@ -1597,11 +1778,16 @@ export default function DashboardPage() {
                         )}
                       </td>
 
-                      {/* Date */}
+                      {/* Date — shows latest job timestamp so rework updates it */}
                       <td className="px-4 py-4 hidden md:table-cell">
-                        <p className="text-xs text-slate-300 tabular-nums">{formatDate(p.created_at)}</p>
-                        <p className="text-[10px] text-slate-400 mt-0.5 tabular-nums">{formatTime(p.created_at)}</p>
-                        <p className="text-[10px] text-slate-600 mt-0.5 tabular-nums">{formatRelativeTime(p.created_at)}</p>
+                        <p className="text-xs text-slate-300 tabular-nums">{formatDate(p.latest_job_created_at ?? p.created_at)}</p>
+                        <p className="text-[10px] text-slate-400 mt-0.5 tabular-nums">{formatTime(p.latest_job_created_at ?? p.created_at)}</p>
+                        <p className="text-[10px] text-slate-600 mt-0.5 tabular-nums">{formatRelativeTime(p.latest_job_created_at ?? p.created_at)}</p>
+                        {p.latest_job_updated_at && p.latest_job_updated_at !== p.latest_job_created_at && (
+                          <p className="text-[10px] text-slate-700 mt-0.5 tabular-nums">
+                            upd {formatRelativeTime(p.latest_job_updated_at)}
+                          </p>
+                        )}
                       </td>
 
                       {/* Actions */}
@@ -1634,8 +1820,9 @@ export default function DashboardPage() {
                           )}
                           <button
                             onClick={() => {
-                              setReworkTarget({ project_id: p.project_id, title: p.title || 'Untitled Project' })
+                              setReworkTarget({ project_id: p.project_id, title: p.title || 'Untitled Project', scene_name: p.latest_job_scene_name ?? '' })
                               setReworkVoiceLang(p.latest_job_language ?? 'hi')
+                              setReworkSceneName('')  // always blank — user picks a name or auto-version is used
                               setReworkError('')
                             }}
                             className="inline-flex items-center gap-1.5 text-xs font-semibold text-indigo-400 bg-indigo-950/40 border border-indigo-800/40 hover:bg-indigo-600 hover:text-white hover:border-indigo-600 rounded-lg px-2.5 py-1.5 transition-all flex-shrink-0"

@@ -180,6 +180,56 @@ def _render_subtitle_image(
     return np.array(img)
 
 
+# ── Free-tier watermark ───────────────────────────────────────────────────────
+_WATERMARK_TEXT        = "REELSYNC FREE TRIAL"
+_WATERMARK_OPACITY     = 60     # 0-255; 60 ≈ 24% — clearly visible without being distracting
+_WATERMARK_ANGLE       = 30     # degrees counter-clockwise
+_WATERMARK_FONT_RATIO  = 0.07   # 7% of the shorter video dimension
+
+
+def _render_watermark_image(video_w: int, video_h: int) -> np.ndarray:
+    """
+    Diagonal semi-transparent watermark for free-tier output.
+
+    Strategy
+    --------
+    1.  Measure the text at a size proportional to the video dimensions.
+    2.  Render it white at ~15% opacity on an oversized transparent canvas
+        (padding prevents rotation from clipping the corners).
+    3.  Rotate the canvas 30° and paste it centred on the full video frame.
+    4.  Return as RGBA numpy array — composited as a static ImageClip that
+        spans the whole video duration via MoviePy.
+    """
+    base = Image.new("RGBA", (video_w, video_h), (0, 0, 0, 0))
+
+    font_size = max(18, int(min(video_w, video_h) * _WATERMARK_FONT_RATIO))
+    font      = _load_font(font_size, "en")
+
+    # Measure text on a throwaway draw so we know canvas size
+    probe = ImageDraw.Draw(base)
+    bbox  = probe.textbbox((0, 0), _WATERMARK_TEXT, font=font)
+    tw    = bbox[2] - bbox[0]
+    th    = bbox[3] - bbox[1]
+
+    # Padded canvas — enough room for the text to rotate without clipping
+    pad    = int(max(tw, th) * 0.65)
+    canvas = Image.new("RGBA", (tw + pad * 2, th + pad * 2), (0, 0, 0, 0))
+    ImageDraw.Draw(canvas).text(
+        (pad, pad),
+        _WATERMARK_TEXT,
+        font=font,
+        fill=(255, 255, 255, _WATERMARK_OPACITY),
+    )
+
+    # Rotate, then centre on the video frame
+    rotated = canvas.rotate(_WATERMARK_ANGLE, expand=True, resample=Image.BICUBIC)
+    x = (video_w - rotated.width)  // 2
+    y = (video_h - rotated.height) // 2
+    base.paste(rotated, (x, y), rotated)
+
+    return np.array(base)
+
+
 class VideoEngine:
     def burn_assets(
         self,
@@ -188,6 +238,7 @@ class VideoEngine:
         subtitles_data: list[dict],
         output_path: str,
         target_lang: str = "",
+        watermark: bool = False,
     ) -> str:
         logger.info(f"Loading video: {original_video_path}")
         video = VideoFileClip(original_video_path)
@@ -202,11 +253,32 @@ class VideoEngine:
             subtitles_data, video.w, video.h, target_lang
         )
 
-        if subtitle_clips:
-            logger.info(f"Compositing {len(subtitle_clips)} subtitle overlay(s)...")
-            final = CompositeVideoClip([video_with_audio] + subtitle_clips)
+        # Build composite layer stack: base → subtitles → watermark (top)
+        overlay_clips: list = subtitle_clips[:]
+
+        if watermark:
+            logger.info(
+                f"[watermark] applying free-tier watermark "
+                f"({video.w}x{video.h}, {video.duration:.1f}s)"
+            )
+            wm_frame = _render_watermark_image(video.w, video.h)
+            # MoviePy does not auto-extract alpha from RGBA arrays — split manually.
+            wm_rgb   = wm_frame[:, :, :3]
+            wm_alpha = wm_frame[:, :, 3].astype(float) / 255.0
+            wm_clip  = (
+                ImageClip(wm_rgb, ismask=False)
+                .set_mask(ImageClip(wm_alpha, ismask=True))
+                .set_duration(video.duration)
+            )
+            overlay_clips.append(wm_clip)
+
+        if overlay_clips:
+            logger.info(
+                f"Compositing: {len(subtitle_clips)} subtitle(s)"
+                f"{' + watermark' if watermark else ''}"
+            )
+            final = CompositeVideoClip([video_with_audio] + overlay_clips)
         else:
-            logger.warning("No subtitles rendered — outputting audio-swap only.")
             final = video_with_audio
 
         logger.info(f"Writing output: {output_path}")

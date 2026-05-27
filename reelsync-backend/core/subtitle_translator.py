@@ -42,6 +42,26 @@ except ImportError:
 _GOOGLE_CHAR_LIMIT = 4_500
 _BATCH_LINE_LIMIT  = 60        # safety cap on lines-per-API-call
 
+# Map codes that come from ElevenLabs / ISO 639 to the exact codes
+# that deep-translator (GoogleTranslator) actually accepts.
+_GOOGLE_LANG_ALIASES: dict[str, str] = {
+    "zh":    "zh-CN",   # ElevenLabs uses bare zh; Google needs zh-CN
+    "zh-cn": "zh-CN",
+    "zh-tw": "zh-TW",
+    "fil":   "tl",      # ElevenLabs: fil  →  Google: tl
+    "he":    "iw",      # ISO 639: he  →  Google: iw
+    "jv":    "jw",      # ISO 639: jv  →  Google: jw
+    "pt-br": "pt",
+    "pt-pt": "pt",
+}
+
+
+def _normalize_google_lang(code: str) -> str:
+    """Return the exact code string that GoogleTranslator accepts."""
+    if code == "auto":
+        return "auto"
+    return _GOOGLE_LANG_ALIASES.get(code.lower(), code)
+
 
 # ---------------------------------------------------------------------------
 # Public helpers
@@ -200,12 +220,15 @@ def _batch_translate(
     pending_indices: list[int] = []
     pending_chars   = 0
 
+    g_source = _normalize_google_lang(source_lang)
+    g_target = _normalize_google_lang(target_lang)
+
     def _flush(indices: list[int]) -> None:
         if not indices:
             return
         texts = [lines[i] for i in indices]
         try:
-            translator = _GoogleTranslator(source=source_lang, target=target_lang)
+            translator = _GoogleTranslator(source=g_source, target=g_target)
             batch_result = translator.translate_batch(texts)
             for idx, translated in zip(indices, batch_result):
                 if translated:
@@ -213,11 +236,11 @@ def _batch_translate(
         except Exception as batch_exc:
             logger.warning(
                 f"[subtitle_translator] batch ({len(indices)} lines) failed "
-                f"({batch_exc}) — retrying line-by-line"
+                f"({g_source} --> {batch_exc}) — retrying line-by-line"
             )
             for idx, text in zip(indices, texts):
                 try:
-                    t = _GoogleTranslator(source=source_lang, target=target_lang).translate(text)
+                    t = _GoogleTranslator(source=g_source, target=g_target).translate(text)
                     if t:
                         result[idx] = t
                 except Exception as line_exc:

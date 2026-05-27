@@ -135,11 +135,15 @@ class ProjectUploadResponse(BaseModel):
 class ProjectHistoryItem(BaseModel):
     project_id: str
     title: str
-    created_at: Optional[str] = None
+    created_at: Optional[str] = None          # project upload date
     latest_job_id: Optional[str] = None
     latest_job_status: Optional[str] = None
     latest_job_language: Optional[str] = None
     latest_job_subtitle_language: Optional[str] = None
+    latest_job_source_language: Optional[str] = None
+    latest_job_scene_name: Optional[str] = None      # user-defined clip/scene label
+    latest_job_created_at: Optional[str] = None      # when the latest job was queued
+    latest_job_updated_at: Optional[str] = None      # last status change timestamp
     output_video_path: Optional[str] = None
     progress_percentage: int = 0
 
@@ -178,84 +182,139 @@ def _validate_lang_code(v: str) -> str:
     return v
 
 
-# ─── Subtitle language — full Google Translate code set ───────────────────────
-# Subtitles are translated via deep-translator (GoogleTranslator backend) so
-# they are independent of the 32-language ElevenLabs dubbing constraint.
-# This set covers all ~130 languages Google Translate supports.
+# ─── Subtitle language — exact GoogleTranslator (deep-translator) code set ────
+# Codes are taken verbatim from the deep-translator error response so they
+# match what GoogleTranslator.translate_batch() accepts.  Codes differ from
+# ISO 639 / ElevenLabs in a few places (zh-CN not zh, tl not fil, iw not he,
+# jw not jv) — normalization is handled in subtitle_translator._normalize_google_lang.
 
 _TRANSLATE_LANG_NAME_TO_CODE: dict[str, str] = {
-    **_LANG_NAME_TO_CODE,  # inherit the 32 ElevenLabs names
-    "afrikaans": "af",      "albanian": "sq",        "amharic": "am",
-    "armenian": "hy",       "azerbaijani": "az",     "basque": "eu",
-    "belarusian": "be",     "bengali": "bn",          "bosnian": "bs",
-    "catalan": "ca",        "cebuano": "ceb",         "corsican": "co",
-    "esperanto": "eo",      "estonian": "et",         "frisian": "fy",
-    "galician": "gl",       "georgian": "ka",         "gujarati": "gu",
-    "haitian creole": "ht", "hausa": "ha",            "hawaiian": "haw",
-    "hebrew": "he",         "hmong": "hmn",           "icelandic": "is",
-    "igbo": "ig",           "irish": "ga",            "javanese": "jv",
-    "kannada": "kn",        "kazakh": "kk",           "khmer": "km",
-    "kinyarwanda": "rw",    "kurdish": "ku",          "kyrgyz": "ky",
-    "lao": "lo",            "latin": "la",            "latvian": "lv",
-    "lithuanian": "lt",     "luxembourgish": "lb",    "macedonian": "mk",
-    "malagasy": "mg",       "malayalam": "ml",        "maltese": "mt",
-    "maori": "mi",          "marathi": "mr",          "mongolian": "mn",
-    "myanmar": "my",        "nepali": "ne",           "pashto": "ps",
-    "persian": "fa",        "punjabi": "pa",          "samoan": "sm",
-    "scots gaelic": "gd",   "serbian": "sr",          "sesotho": "st",
-    "shona": "sn",          "sindhi": "sd",           "sinhala": "si",
-    "somali": "so",         "sundanese": "su",        "swahili": "sw",
-    "tagalog": "tl",        "tajik": "tg",            "telugu": "te",
-    "thai": "th",           "urdu": "ur",             "uzbek": "uz",
-    "welsh": "cy",          "xhosa": "xh",            "yiddish": "yi",
-    "yoruba": "yo",         "zulu": "zu",
+    "afrikaans": "af",              "albanian": "sq",
+    "amharic": "am",                "arabic": "ar",
+    "armenian": "hy",               "assamese": "as",
+    "aymara": "ay",                 "azerbaijani": "az",
+    "bambara": "bm",                "basque": "eu",
+    "belarusian": "be",             "bengali": "bn",
+    "bhojpuri": "bho",              "bosnian": "bs",
+    "bulgarian": "bg",              "catalan": "ca",
+    "cebuano": "ceb",               "chichewa": "ny",
+    "chinese (simplified)": "zh-CN","chinese (traditional)": "zh-TW",
+    "chinese": "zh-CN",             "corsican": "co",
+    "croatian": "hr",               "czech": "cs",
+    "danish": "da",                 "dhivehi": "dv",
+    "dogri": "doi",                 "dutch": "nl",
+    "english": "en",                "esperanto": "eo",
+    "estonian": "et",               "ewe": "ee",
+    "filipino": "tl",               "finnish": "fi",
+    "french": "fr",                 "frisian": "fy",
+    "galician": "gl",               "georgian": "ka",
+    "german": "de",                 "greek": "el",
+    "guarani": "gn",                "gujarati": "gu",
+    "haitian creole": "ht",         "hausa": "ha",
+    "hawaiian": "haw",              "hebrew": "iw",
+    "hindi": "hi",                  "hmong": "hmn",
+    "hungarian": "hu",              "icelandic": "is",
+    "igbo": "ig",                   "ilocano": "ilo",
+    "indonesian": "id",             "irish": "ga",
+    "italian": "it",                "japanese": "ja",
+    "javanese": "jw",               "kannada": "kn",
+    "kazakh": "kk",                 "khmer": "km",
+    "kinyarwanda": "rw",            "konkani": "gom",
+    "korean": "ko",                 "krio": "kri",
+    "kurdish (kurmanji)": "ku",     "kurdish (sorani)": "ckb",
+    "kyrgyz": "ky",                 "lao": "lo",
+    "latin": "la",                  "latvian": "lv",
+    "lingala": "ln",                "lithuanian": "lt",
+    "luganda": "lg",                "luxembourgish": "lb",
+    "macedonian": "mk",             "maithili": "mai",
+    "malagasy": "mg",               "malay": "ms",
+    "malayalam": "ml",              "maltese": "mt",
+    "maori": "mi",                  "marathi": "mr",
+    "meiteilon (manipuri)": "mni-Mtei", "mizo": "lus",
+    "mongolian": "mn",              "myanmar": "my",
+    "nepali": "ne",                 "norwegian": "no",
+    "odia (oriya)": "or",           "oromo": "om",
+    "pashto": "ps",                 "persian": "fa",
+    "polish": "pl",                 "portuguese": "pt",
+    "punjabi": "pa",                "quechua": "qu",
+    "romanian": "ro",               "russian": "ru",
+    "samoan": "sm",                 "sanskrit": "sa",
+    "scots gaelic": "gd",           "sepedi": "nso",
+    "serbian": "sr",                "sesotho": "st",
+    "shona": "sn",                  "sindhi": "sd",
+    "sinhala": "si",                "slovak": "sk",
+    "slovenian": "sl",              "somali": "so",
+    "spanish": "es",                "sundanese": "su",
+    "swahili": "sw",                "swedish": "sv",
+    "tajik": "tg",                  "tamil": "ta",
+    "tatar": "tt",                  "telugu": "te",
+    "thai": "th",                   "tigrinya": "ti",
+    "tsonga": "ts",                 "turkish": "tr",
+    "turkmen": "tk",                "twi": "ak",
+    "ukrainian": "uk",              "urdu": "ur",
+    "uyghur": "ug",                 "uzbek": "uz",
+    "vietnamese": "vi",             "welsh": "cy",
+    "xhosa": "xh",                  "yiddish": "yi",
+    "yoruba": "yo",                 "zulu": "zu",
 }
 
-_TRANSLATE_LANG_CODES: frozenset[str] = frozenset({
-    # ElevenLabs 32 (all valid Google Translate targets too)
-    "ar", "bg", "zh", "hr", "cs", "da", "nl", "en", "fil", "fi", "fr", "de",
-    "el", "hi", "hu", "id", "it", "ja", "ko", "ms", "no", "pl", "pt", "ro",
-    "ru", "sk", "es", "sv", "ta", "tr", "uk", "vi",
-    # Extended Google Translate codes
-    "af", "sq", "am", "hy", "az", "eu", "be", "bn", "bs", "ca", "ceb", "co",
-    "eo", "et", "fy", "gl", "ka", "gu", "ht", "ha", "haw", "he", "hmn", "is",
-    "ig", "ga", "jv", "kn", "kk", "km", "rw", "ku", "ky", "lo", "la", "lv",
-    "lt", "lb", "mk", "mg", "ml", "mt", "mi", "mr", "mn", "my", "ne", "ps",
-    "fa", "pa", "sm", "gd", "sr", "st", "sn", "sd", "si", "so", "su", "sw",
-    "tl", "tg", "te", "th", "ur", "uz", "cy", "xh", "yi", "yo", "zu",
-    # BCP-47 regional variants accepted by Google Translate
-    "zh-cn", "zh-tw", "pt-br", "pt-pt",
-})
+# Aliases so users can still type zh, fil, he, jv etc.
+_GOOGLE_SUBTITLE_ALIASES: dict[str, str] = {
+    "zh": "zh-CN", "zh-cn": "zh-CN", "zh-tw": "zh-TW",
+    "fil": "tl", "he": "iw", "jv": "jw",
+    "pt-br": "pt", "pt-pt": "pt",
+}
+
+_TRANSLATE_LANG_CODES: frozenset[str] = frozenset(_TRANSLATE_LANG_NAME_TO_CODE.values())
 
 
 def _validate_subtitle_lang_code(v: str) -> str:
-    """Validate against Google Translate's language set (any subtitle language)."""
+    """Validate against the exact code set that deep-translator (GoogleTranslator) accepts."""
     v = v.strip().lower()
+    # Check full name first (e.g. "hindi" → "hi")
     if v in _TRANSLATE_LANG_NAME_TO_CODE:
-        v = _TRANSLATE_LANG_NAME_TO_CODE[v]
+        return _TRANSLATE_LANG_NAME_TO_CODE[v]
+    # Normalize aliases (zh→zh-CN, fil→tl, he→iw, jv→jw, etc.)
+    v = _GOOGLE_SUBTITLE_ALIASES.get(v, v)
     if v not in _TRANSLATE_LANG_CODES:
         raise ValueError(
-            f"'{v}' is not a recognized subtitle language code. "
-            "Use a standard ISO 639-1 code (e.g. 'en', 'hi', 'fr', 'zh-cn')."
+            f"'{v}' is not a supported subtitle language. "
+            "Use a language name (e.g. 'hindi') or its code (e.g. 'hi', 'zh-CN')."
         )
     return v
 
 
 class VideoProcess(BaseModel):
+    scene_name: Optional[str] = None        # user-defined clip/scene label; drives output filename
     target_voice_language: str
     target_subtitle_language: str = "en"
+    source_language: str = "auto"   # "auto" lets ElevenLabs detect; or pass BCP-47 code
 
     @field_validator("target_voice_language")
     @classmethod
     def validate_voice_lang(cls, v: str) -> str:
-        # ElevenLabs dubbing supports exactly 32 languages
         return _validate_lang_code(v)
 
     @field_validator("target_subtitle_language")
     @classmethod
     def validate_subtitle_lang(cls, v: str) -> str:
-        # Subtitles are translated via deep-translator — any language is valid
         return _validate_subtitle_lang_code(v)
+
+    @field_validator("source_language")
+    @classmethod
+    def validate_source_lang(cls, v: str) -> str:
+        v = v.strip().lower()
+        if v == "auto":
+            return v
+        # Accept any ElevenLabs or Google Translate code when explicitly supplied
+        if v in _TRANSLATE_LANG_NAME_TO_CODE:
+            v = _TRANSLATE_LANG_NAME_TO_CODE[v]
+        if v not in _TRANSLATE_LANG_CODES:
+            raise ValueError(
+                f"'{v}' is not a recognised language code. "
+                "Use 'auto' for auto-detection or a standard ISO 639-1 code."
+            )
+        return v
 
 
 class OTPVerify(BaseModel):
@@ -372,13 +431,16 @@ class ProcessResponse(BaseModel):
     target_language: str
     status: str
     message: str
+    new_project_title: Optional[str] = None  # set by /rework endpoint
 
 
 class JobStatusResponse(BaseModel):
     job_id: str
     project_id: str
     status: str
+    scene_name: Optional[str] = None
     target_language: str
+    source_language: Optional[str] = None
     output_video_path: Optional[str] = None
     error_message: Optional[str] = None
     created_at: Optional[str] = None

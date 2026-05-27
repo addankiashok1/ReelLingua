@@ -42,7 +42,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from config import PROFITABLE_TIERS, STORAGE_DIR
-from core.pipeline import run_background_job
+from core.pipeline import MAX_CONCURRENT_JOBS, _job_semaphore, run_background_job
 from database import get_db
 from models.db_models import Project, RenderJob, User
 from models.schemas import (
@@ -94,6 +94,10 @@ async def _list_projects(
             latest_job_status=latest_job.status if latest_job else None,
             latest_job_language=latest_job.target_language if latest_job else None,
             latest_job_subtitle_language=latest_job.subtitle_language if latest_job else None,
+            latest_job_source_language=latest_job.source_language if latest_job else None,
+            latest_job_scene_name=latest_job.scene_name if latest_job else None,
+            latest_job_created_at=str(latest_job.created_at) if latest_job else None,
+            latest_job_updated_at=str(latest_job.updated_at) if latest_job else None,
             output_video_path=latest_job.output_video_path if latest_job else None,
             progress_percentage=latest_job.progress_percentage if latest_job else 0,
         ))
@@ -341,19 +345,26 @@ async def process_video(
         )
 
     # ── Language parameters ───────────────────────────────────────────────────
-    # target_voice_language  → ElevenLabs dubbing language (validates against 32 codes)
+    # target_voice_language    → ElevenLabs dubbing language (validates against 32 codes)
     # target_subtitle_language → subtitle burn language (validates against ~130 codes)
+    # source_language          → "auto" (ElevenLabs detects) or explicit BCP-47 code
     #
-    # Both are passed verbatim to the background task.  The pipeline handles the
-    # decoupling; no language routing logic belongs here.
+    # All three are passed verbatim to the background task.  The pipeline handles
+    # the decoupling; no language routing logic belongs here.
     voice_lang    = body.target_voice_language
     subtitle_lang = body.target_subtitle_language
+    source_lang   = body.source_language  # "auto" or explicit code
+    scene_name    = (body.scene_name or "").strip() or None  # None → use job_id as filename
 
+    # Always INSERT a brand-new job row with a fresh UUID and timestamp.
+    # Re-processing a project never touches prior job records — history is preserved.
     job = RenderJob(
         id=uuid.uuid4(),
         project_id=project.id,
+        scene_name=scene_name,
         target_language=voice_lang,
         subtitle_language=subtitle_lang,
+        source_language=source_lang,
         status="PENDING",
     )
     db.add(job)
@@ -361,9 +372,9 @@ async def process_video(
     await db.refresh(job)
 
     logger.info(
-        f"[process] job_id={job.id} project_id={project_id} "
+        f"[process] new job_id={job.id} project_id={project_id} "
         f"user_id={current_user.id} voice_lang={voice_lang} "
-        f"subtitle_lang={subtitle_lang} plan={plan} "
+        f"source_lang={source_lang} subtitle_lang={subtitle_lang} plan={plan} "
         f"chars_remaining={chars_remaining} "
         f"cross_subtitle={'yes' if voice_lang != subtitle_lang else 'no'}"
     )
@@ -376,6 +387,8 @@ async def process_video(
         video_local_path=project.original_video_path,
         target_lang=voice_lang,
         subtitle_lang=subtitle_lang,
+        source_lang=source_lang,
+        scene_name=scene_name or "",
     )
 
     return ProcessResponse(
@@ -426,13 +439,161 @@ async def get_job_status(
         job_id=str(job.id),
         project_id=str(job.project_id),
         status=job.status,
+        scene_name=job.scene_name,
         target_language=job.target_language,
+        source_language=job.source_language,
         output_video_path=job.output_video_path,
         error_message=job.error_message,
         created_at=str(job.created_at),
         updated_at=str(job.updated_at),
         progress_percentage=job.progress_percentage or 0,
     )
+
+
+# ─── POST /rework/{project_id} ───────────────────────────────────────────────
+
+@router.post(
+    "/rework/{project_id}",
+    response_model=ProcessResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Re-process a video as a brand-new versioned project",
+)
+async def rework_video(
+    project_id: str,
+    body: VideoProcess,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Creates a brand-new Project that reuses the same uploaded video file.
+
+    Title resolution
+    ────────────────
+    • If body.scene_name is provided → new project title = scene_name.
+    • Otherwise → strip trailing " v<n>" from the original title, count all
+      projects by this user that share the same base, and assign
+      "{base} v{count + 1}" (so the first rework becomes "Movie v2", etc.).
+
+    The original project and all its render-job history are never touched.
+    """
+    try:
+        orig_uuid = uuid.UUID(project_id)
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid project_id.")
+
+    result = await db.execute(
+        select(Project)
+        .where(Project.id == orig_uuid)
+        .where(Project.user_id == current_user.id)
+    )
+    original: Optional[Project] = result.scalar_one_or_none()
+    if not original:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Project '{project_id}' not found or does not belong to you.",
+        )
+
+    # ── Credit check ──────────────────────────────────────────────────────────
+    plan = (current_user.subscription_plan or "free").lower()
+    if plan != "free" and current_user.credit_minutes < 1:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail=f"Insufficient credits ({current_user.credit_minutes} remaining).",
+        )
+
+    # ── Determine new project title ───────────────────────────────────────────
+    import re as _re
+    custom_name = (body.scene_name or "").strip()
+    if custom_name:
+        new_title = custom_name
+        scene_name = custom_name
+    else:
+        # Strip trailing " v<n>" to find the canonical base title
+        base = _re.sub(r'\s+v\d+$', '', original.title.strip())
+        # Count all projects by this user whose base title matches (includes original)
+        siblings_result = await db.execute(
+            select(Project.title).where(Project.user_id == current_user.id)
+        )
+        count = sum(
+            1 for (t,) in siblings_result.all()
+            if _re.sub(r'\s+v\d+$', '', t.strip()) == base
+        )
+        new_title = f"{base} v{count + 1}"
+        scene_name = ""
+
+    # ── Create new Project reusing the same video ─────────────────────────────
+    new_project = Project(
+        id=uuid.uuid4(),
+        user_id=current_user.id,
+        title=new_title,
+        original_video_path=original.original_video_path,
+    )
+    db.add(new_project)
+    await db.flush()
+
+    voice_lang    = body.target_voice_language
+    subtitle_lang = body.target_subtitle_language
+    source_lang   = body.source_language
+
+    job = RenderJob(
+        id=uuid.uuid4(),
+        project_id=new_project.id,
+        scene_name=scene_name or None,
+        target_language=voice_lang,
+        subtitle_language=subtitle_lang,
+        source_language=source_lang,
+        status="PENDING",
+    )
+    db.add(job)
+    await db.commit()
+    await db.refresh(job)
+
+    logger.info(
+        f"[rework] new project_id={new_project.id} title='{new_title}' "
+        f"from project_id={project_id} user_id={current_user.id} "
+        f"voice_lang={voice_lang} subtitle_lang={subtitle_lang}"
+    )
+
+    background_tasks.add_task(
+        run_background_job,
+        job_id=str(job.id),
+        project_id=str(new_project.id),
+        user_id=str(current_user.id),
+        video_local_path=original.original_video_path,
+        target_lang=voice_lang,
+        subtitle_lang=subtitle_lang,
+        source_lang=source_lang,
+        scene_name=scene_name,
+    )
+
+    return ProcessResponse(
+        job_id=str(job.id),
+        project_id=str(new_project.id),
+        target_language=voice_lang,
+        status="PENDING",
+        new_project_title=new_title,
+        message=f"New project '{new_title}' created. Poll GET /api/videos/jobs/{job.id} for status.",
+    )
+
+
+# ─── GET /queue ───────────────────────────────────────────────────────────────
+
+@router.get(
+    "/queue",
+    summary="Return current concurrency slot usage",
+)
+async def get_queue_status():
+    """
+    Reports how many of the MAX_CONCURRENT_JOBS slots are currently occupied
+    and how many are free.  Useful for health checks and the admin dashboard.
+    """
+    active = MAX_CONCURRENT_JOBS - _job_semaphore._value
+    return {
+        "max_concurrent_jobs": MAX_CONCURRENT_JOBS,
+        "active_jobs":         active,
+        "available_slots":     MAX_CONCURRENT_JOBS - active,
+    }
 
 
 # ─── GET /credits ─────────────────────────────────────────────────────────────
