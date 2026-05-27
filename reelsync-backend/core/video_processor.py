@@ -13,11 +13,46 @@ from moviepy.editor import (
 
 logger = logging.getLogger(__name__)
 
-CAPTION_FONTSIZE = 58
-CAPTION_COLOR = (255, 255, 255, 255)
+# ── All subtitle metrics are derived from video dimensions ───────────────────
+# Nothing is a hardcoded pixel value.  Every constant below is a RATIO so the
+# rendered result looks identical whether the video is 360p, 1080p, 4K, or a
+# vertical 9:16 Reels clip.
+CAPTION_COLOR        = (255, 255, 255, 255)
 CAPTION_STROKE_COLOR = (0, 0, 0, 255)
-CAPTION_STROKE_WIDTH = 3
-CAPTION_Y_RATIO = 0.70
+CAPTION_BOX_COLOR    = (0, 0, 0, 115)   # black ~45% opacity
+
+# Ratios (all relative to video_h unless stated)
+_FONT_RATIO          = 0.035   # font size  ≈ 3.5 % of height
+_FONT_MIN            = 20      # px floor — legible on tiny clips
+_FONT_MAX            = 48      # px ceiling — doesn't balloon on 4K
+
+_STROKE_RATIO        = 0.05    # stroke     ≈ 5 % of font size   (min 1 px)
+_LINE_SPACING_RATIO  = 0.15    # gap        ≈ 15% of font size   (min 3 px)
+_BOTTOM_PAD_RATIO    = 0.025   # gap above bottom edge ≈ 2.5% of height
+_BOX_PAD_RATIO       = 0.20    # box inset  ≈ 20% of font size   (min 4 px)
+_TEXT_WIDTH_RATIO    = 0.78    # subtitle column ≈ 78% of video width
+
+
+def _subtitle_metrics(video_w: int, video_h: int) -> dict:
+    """
+    Return every subtitle dimension scaled to the actual video resolution.
+    Call once per subtitle image render so nothing is ever hard-coded.
+    """
+    font_size    = max(_FONT_MIN, min(int(video_h * _FONT_RATIO), _FONT_MAX))
+    stroke_w     = max(1, int(font_size * _STROKE_RATIO))
+    line_spacing = max(3, int(font_size * _LINE_SPACING_RATIO))
+    bottom_pad   = max(10, int(video_h * _BOTTOM_PAD_RATIO))
+    box_pad      = max(4,  int(font_size * _BOX_PAD_RATIO))
+    max_text_w   = int(video_w * _TEXT_WIDTH_RATIO)
+    return {
+        "font_size":    font_size,
+        "stroke_w":     stroke_w,
+        "line_spacing": line_spacing,
+        "line_h":       font_size + line_spacing,
+        "bottom_pad":   bottom_pad,
+        "box_pad":      box_pad,
+        "max_text_w":   max_text_w,
+    }
 
 _FONTS_DIR = r"C:\Windows\Fonts"
 
@@ -99,36 +134,48 @@ def _wrap_text(
 def _render_subtitle_image(
     text: str, video_w: int, video_h: int, lang: str
 ) -> np.ndarray:
-    img = Image.new("RGBA", (video_w, video_h), (0, 0, 0, 0))
+    m    = _subtitle_metrics(video_w, video_h)
+    img  = Image.new("RGBA", (video_w, video_h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
-    font = _load_font(CAPTION_FONTSIZE, lang)
+    font = _load_font(m["font_size"], lang)
 
-    max_text_w = int(video_w * 0.88)
-    lines = _wrap_text(text, font, draw, max_text_w)
+    lines   = _wrap_text(text, font, draw, m["max_text_w"])
+    block_h = len(lines) * m["line_h"]
 
-    line_spacing = 10
-    line_h = CAPTION_FONTSIZE + line_spacing
-    block_h = len(lines) * line_h
-    y = int(video_h * CAPTION_Y_RATIO) - block_h // 2
+    # Widest rendered line — drives background box width
+    line_widths = [draw.textbbox((0, 0), ln, font=font)[2] for ln in lines]
+    max_line_w  = max(line_widths) if line_widths else m["max_text_w"]
 
-    sw = CAPTION_STROKE_WIDTH
+    # Bottom-anchor: place the block flush to the lower safe area
+    y0 = video_h - block_h - m["bottom_pad"]
+
+    # Translucent background pill
+    bp = m["box_pad"]
+    draw.rectangle(
+        [
+            (video_w - max_line_w) // 2 - bp,
+            y0 - bp,
+            (video_w + max_line_w) // 2 + bp,
+            y0 + block_h + bp,
+        ],
+        fill=CAPTION_BOX_COLOR,
+    )
+
+    # Render each line: stroke first, then white fill on top
+    sw = m["stroke_w"]
+    y  = y0
     for line in lines:
-        bbox = draw.textbbox((0, 0), line, font=font)
+        bbox   = draw.textbbox((0, 0), line, font=font)
         text_w = bbox[2] - bbox[0]
         x = (video_w - text_w) // 2
 
         for dx in range(-sw, sw + 1):
             for dy in range(-sw, sw + 1):
-                if dx != 0 or dy != 0:
-                    draw.text(
-                        (x + dx, y + dy),
-                        line,
-                        font=font,
-                        fill=CAPTION_STROKE_COLOR,
-                    )
+                if dx or dy:
+                    draw.text((x + dx, y + dy), line, font=font, fill=CAPTION_STROKE_COLOR)
 
         draw.text((x, y), line, font=font, fill=CAPTION_COLOR)
-        y += line_h
+        y += m["line_h"]
 
     return np.array(img)
 

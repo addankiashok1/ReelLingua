@@ -26,7 +26,8 @@ from sqlalchemy import update
 
 import config
 from config import PROFITABLE_TIERS
-from core.ai_client import AIOrchestrator
+from core.ai_client import AIOrchestrator, parse_srt
+from core.subtitle_translator import translate_srt_file, translate_subtitles_data
 from core.video_processor import VideoEngine
 
 logging.basicConfig(
@@ -134,20 +135,129 @@ async def run_background_job(
         logger.info(f"[pipeline] job={job_id} → EXTRACTED_AUDIO  (submitting to ElevenLabs)")
 
         ai = AIOrchestrator()
-        dubbed_audio_path, subtitles_data, actual_sub_lang = await asyncio.to_thread(
+        dubbed_audio_path, subtitles_data = await asyncio.to_thread(
             ai.generate_dubbed_audio,
             video_local_path,
             target_lang,
             job_temp_dir,
-            subtitle_lang,
         )
 
         # ── Milestone 3: CLONED_AUDIO (45%) — ElevenLabs returned ────────────
         await set_status("CLONED_AUDIO", progress_percentage=45)
         logger.info(
             f"[pipeline] job={job_id} → CLONED_AUDIO  "
-            f"({len(subtitles_data)} subtitle cues)"
+            f"({len(subtitles_data)} subtitle cues, audio_lang={target_lang})"
         )
+
+        # ── Subtitle translation layer ────────────────────────────────────────
+        # ElevenLabs always returns the SRT in target_lang (the dubbed language).
+        # When the user requests a different subtitle language we translate now,
+        # before the video burn, so any audio+subtitle language pair is supported.
+        #
+        # Two-path strategy (file → in-memory) ensures translation never silently
+        # falls through to the wrong language:
+        #
+        #   Path A — file-based (preferred)
+        #       Use the saved subtitles_{target_lang}.srt, translate it with
+        #       deep-translator, write bypass_subtitles_{subtitle_lang}.srt, re-parse.
+        #
+        #   Path B — in-memory fallback
+        #       If the SRT file is missing for any reason, translate the already-
+        #       parsed subtitles_data list directly.  Same result, no filesystem
+        #       dependency.
+        #
+        # Either path updates both subtitles_data AND actual_sub_lang so that:
+        #   - The video engine burns the translated (target) text
+        #   - Font selection uses the correct script for the subtitle language
+        actual_sub_lang: str = target_lang
+
+        if subtitle_lang and subtitle_lang != target_lang:
+            await set_status("CLONED_AUDIO", progress_percentage=48)
+            logger.info(
+                f"[pipeline] job={job_id} subtitle translation required: "
+                f"audio={target_lang} → subtitles={subtitle_lang}"
+            )
+
+            srt_path = os.path.join(job_temp_dir, f"subtitles_{target_lang}.srt")
+            translation_succeeded = False
+
+            # ── Path A: file-based translation ───────────────────────────────
+            if os.path.isfile(srt_path):
+                try:
+                    bypass_path, resolved_lang = await asyncio.to_thread(
+                        translate_srt_file,
+                        srt_path,
+                        subtitle_lang,
+                        target_lang,
+                    )
+                    if bypass_path != srt_path:
+                        with open(bypass_path, encoding="utf-8") as fh:
+                            translated_cues = parse_srt(fh.read())
+                        if translated_cues:
+                            subtitles_data  = translated_cues
+                            actual_sub_lang = resolved_lang
+                            translation_succeeded = True
+                            logger.info(
+                                f"[pipeline] job={job_id} Path-A translation done → "
+                                f"{len(subtitles_data)} cues in '{actual_sub_lang}' "
+                                f"(saved: {os.path.basename(bypass_path)})"
+                            )
+                        else:
+                            logger.warning(
+                                f"[pipeline] job={job_id} Path-A parsed 0 cues "
+                                f"from translated SRT — trying Path-B"
+                            )
+                except Exception as path_a_exc:
+                    logger.warning(
+                        f"[pipeline] job={job_id} Path-A failed ({path_a_exc}) "
+                        f"— trying Path-B"
+                    )
+            else:
+                logger.warning(
+                    f"[pipeline] job={job_id} SRT file not found at {srt_path} "
+                    f"— skipping Path-A, using Path-B"
+                )
+
+            # ── Path B: in-memory fallback ────────────────────────────────────
+            if not translation_succeeded:
+                try:
+                    translated_cues = await asyncio.to_thread(
+                        translate_subtitles_data,
+                        subtitles_data,
+                        subtitle_lang,
+                        target_lang,
+                    )
+                    # translate_subtitles_data returns originals on failure;
+                    # spot-check that at least one cue text actually changed.
+                    changed = sum(
+                        1 for orig, xlat in zip(subtitles_data, translated_cues)
+                        if orig["text"] != xlat["text"]
+                    )
+                    if changed:
+                        subtitles_data  = translated_cues
+                        actual_sub_lang = subtitle_lang
+                        translation_succeeded = True
+                        logger.info(
+                            f"[pipeline] job={job_id} Path-B translation done → "
+                            f"{changed}/{len(subtitles_data)} cues changed, "
+                            f"lang='{actual_sub_lang}'"
+                        )
+                    else:
+                        logger.warning(
+                            f"[pipeline] job={job_id} Path-B returned 0 changed cues "
+                            f"— subtitle language stays '{actual_sub_lang}'"
+                        )
+                except Exception as path_b_exc:
+                    logger.error(
+                        f"[pipeline] job={job_id} Path-B also failed ({path_b_exc}) "
+                        f"— subtitles will be in audio language '{target_lang}'"
+                    )
+
+            if not translation_succeeded:
+                logger.warning(
+                    f"[pipeline] job={job_id} SUBTITLE TRANSLATION FAILED — "
+                    f"burning '{target_lang}' subtitles instead of '{subtitle_lang}'"
+                )
 
         # ── Character density guard ───────────────────────────────────────────
         incoming_char_count = sum(len(cue["text"]) for cue in subtitles_data)

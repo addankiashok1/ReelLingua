@@ -165,6 +165,7 @@ _SUPPORTED_CODES: set[str] = set(_LANG_NAME_TO_CODE.values())
 
 
 def _validate_lang_code(v: str) -> str:
+    """Validate against ElevenLabs' 32 supported dubbing languages."""
     v = v.strip().lower()
     if v in _LANG_NAME_TO_CODE:
         v = _LANG_NAME_TO_CODE[v]
@@ -177,6 +178,69 @@ def _validate_lang_code(v: str) -> str:
     return v
 
 
+# ─── Subtitle language — full Google Translate code set ───────────────────────
+# Subtitles are translated via deep-translator (GoogleTranslator backend) so
+# they are independent of the 32-language ElevenLabs dubbing constraint.
+# This set covers all ~130 languages Google Translate supports.
+
+_TRANSLATE_LANG_NAME_TO_CODE: dict[str, str] = {
+    **_LANG_NAME_TO_CODE,  # inherit the 32 ElevenLabs names
+    "afrikaans": "af",      "albanian": "sq",        "amharic": "am",
+    "armenian": "hy",       "azerbaijani": "az",     "basque": "eu",
+    "belarusian": "be",     "bengali": "bn",          "bosnian": "bs",
+    "catalan": "ca",        "cebuano": "ceb",         "corsican": "co",
+    "esperanto": "eo",      "estonian": "et",         "frisian": "fy",
+    "galician": "gl",       "georgian": "ka",         "gujarati": "gu",
+    "haitian creole": "ht", "hausa": "ha",            "hawaiian": "haw",
+    "hebrew": "he",         "hmong": "hmn",           "icelandic": "is",
+    "igbo": "ig",           "irish": "ga",            "javanese": "jv",
+    "kannada": "kn",        "kazakh": "kk",           "khmer": "km",
+    "kinyarwanda": "rw",    "kurdish": "ku",          "kyrgyz": "ky",
+    "lao": "lo",            "latin": "la",            "latvian": "lv",
+    "lithuanian": "lt",     "luxembourgish": "lb",    "macedonian": "mk",
+    "malagasy": "mg",       "malayalam": "ml",        "maltese": "mt",
+    "maori": "mi",          "marathi": "mr",          "mongolian": "mn",
+    "myanmar": "my",        "nepali": "ne",           "pashto": "ps",
+    "persian": "fa",        "punjabi": "pa",          "samoan": "sm",
+    "scots gaelic": "gd",   "serbian": "sr",          "sesotho": "st",
+    "shona": "sn",          "sindhi": "sd",           "sinhala": "si",
+    "somali": "so",         "sundanese": "su",        "swahili": "sw",
+    "tagalog": "tl",        "tajik": "tg",            "telugu": "te",
+    "thai": "th",           "urdu": "ur",             "uzbek": "uz",
+    "welsh": "cy",          "xhosa": "xh",            "yiddish": "yi",
+    "yoruba": "yo",         "zulu": "zu",
+}
+
+_TRANSLATE_LANG_CODES: frozenset[str] = frozenset({
+    # ElevenLabs 32 (all valid Google Translate targets too)
+    "ar", "bg", "zh", "hr", "cs", "da", "nl", "en", "fil", "fi", "fr", "de",
+    "el", "hi", "hu", "id", "it", "ja", "ko", "ms", "no", "pl", "pt", "ro",
+    "ru", "sk", "es", "sv", "ta", "tr", "uk", "vi",
+    # Extended Google Translate codes
+    "af", "sq", "am", "hy", "az", "eu", "be", "bn", "bs", "ca", "ceb", "co",
+    "eo", "et", "fy", "gl", "ka", "gu", "ht", "ha", "haw", "he", "hmn", "is",
+    "ig", "ga", "jv", "kn", "kk", "km", "rw", "ku", "ky", "lo", "la", "lv",
+    "lt", "lb", "mk", "mg", "ml", "mt", "mi", "mr", "mn", "my", "ne", "ps",
+    "fa", "pa", "sm", "gd", "sr", "st", "sn", "sd", "si", "so", "su", "sw",
+    "tl", "tg", "te", "th", "ur", "uz", "cy", "xh", "yi", "yo", "zu",
+    # BCP-47 regional variants accepted by Google Translate
+    "zh-cn", "zh-tw", "pt-br", "pt-pt",
+})
+
+
+def _validate_subtitle_lang_code(v: str) -> str:
+    """Validate against Google Translate's language set (any subtitle language)."""
+    v = v.strip().lower()
+    if v in _TRANSLATE_LANG_NAME_TO_CODE:
+        v = _TRANSLATE_LANG_NAME_TO_CODE[v]
+    if v not in _TRANSLATE_LANG_CODES:
+        raise ValueError(
+            f"'{v}' is not a recognized subtitle language code. "
+            "Use a standard ISO 639-1 code (e.g. 'en', 'hi', 'fr', 'zh-cn')."
+        )
+    return v
+
+
 class VideoProcess(BaseModel):
     target_voice_language: str
     target_subtitle_language: str = "en"
@@ -184,12 +248,14 @@ class VideoProcess(BaseModel):
     @field_validator("target_voice_language")
     @classmethod
     def validate_voice_lang(cls, v: str) -> str:
+        # ElevenLabs dubbing supports exactly 32 languages
         return _validate_lang_code(v)
 
     @field_validator("target_subtitle_language")
     @classmethod
     def validate_subtitle_lang(cls, v: str) -> str:
-        return _validate_lang_code(v)
+        # Subtitles are translated via deep-translator — any language is valid
+        return _validate_subtitle_lang_code(v)
 
 
 class OTPVerify(BaseModel):

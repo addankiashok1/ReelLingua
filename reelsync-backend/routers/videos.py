@@ -1,3 +1,28 @@
+"""
+routers/videos.py
+------------------
+HTTP layer only.  Responsibilities:
+
+  1. Validate incoming requests (ownership, credits, language codes).
+  2. Persist Project and RenderJob rows to the database.
+  3. Queue a background task that runs the full render pipeline.
+  4. Return lightweight status/poll responses.
+
+Subtitle translation is NOT done here.
+──────────────────────────────────────
+The router queues run_background_job() which runs *after* the HTTP response
+is already sent.  Placing ElevenLabs I/O or translation network calls here
+would block the event-loop thread for several minutes and defeat FastAPI's
+async model entirely.
+
+The cross-subtitle decoupling happens inside core/pipeline.py, immediately
+after ElevenLabs returns the dubbed audio track, via a two-path translation
+strategy (file-based → in-memory fallback) implemented in
+core/subtitle_translator.py.  The router's only job is to pass
+`subtitle_lang=body.target_subtitle_language` to the background task, which
+it already does.
+"""
+
 import logging
 import os
 import uuid
@@ -237,27 +262,45 @@ async def process_video(
     current_user: User = Depends(get_current_user),
 ):
     """
-    Pre-flight checks (synchronous, before the job is queued):
-    ─────────────────────────────────────────────────────────
-    1.  Ownership: project must belong to the current user (404 if not).
-    2.  Credit gate: user must have at least 1 credit_minute (402 if not).
+    Pre-flight checks (synchronous, < 1 ms each):
+    ──────────────────────────────────────────────
+    1.  Ownership: project must belong to the current user.
+    2.  Credit gate: user must have ≥ 1 credit_minute (bypassed for free plan).
 
-    Character-density guard (asynchronous, inside the background job):
-    ──────────────────────────────────────────────────────────────────
-    After ElevenLabs returns the subtitle transcript the pipeline computes
-    incoming_char_count = Σ len(cue.text) and compares it against the user's
-    chars_balance (see config.PROFITABLE_TIERS for per-plan limits).
+    What this endpoint does NOT do
+    ───────────────────────────────
+    - It does NOT call ElevenLabs.
+    - It does NOT translate subtitles.
+    - It does NOT render video.
 
-    If the video is too word-dense for the remaining balance the job is
-    marked FAILED immediately with:
-        error_code: "DENSE_TEXT_LIMIT"
-        message:    "This video contains too many spoken words…"
-    No credit minute is deducted in that case.
+    All of that runs inside run_background_job() *after* this endpoint has
+    already returned HTTP 202.  Cross-subtitle translation is decoupled from
+    the dubbing language entirely inside core/pipeline.py:
 
-    On success, both 1 credit_minute and the actual char count are deducted
-    atomically from the user row.
+        ElevenLabs dubs in target_voice_language
+            ↓
+        SRT transcript is always in target_voice_language
+            ↓
+        If target_subtitle_language ≠ target_voice_language:
+            Path A → translate SRT file via deep-translator
+            Path B → translate parsed cues in-memory (fallback)
+            actual_sub_lang is set to target_subtitle_language on success
+            ↓
+        _burn_video receives the translated cues + actual_sub_lang
+        for correct font selection (Nirmala.ttc for Indic, Arial for Latin, …)
 
-    Ownership enforced by filtering on both project_id AND current_user.id.
+    Both language parameters are passed to the background task below
+    as `target_lang` and `subtitle_lang` — that is the full extent of
+    this router's cross-subtitle responsibility.
+
+    Character-density guard (async, inside the background job):
+    ────────────────────────────────────────────────────────────
+    After ElevenLabs returns the transcript the pipeline checks
+    incoming_char_count against the user's chars_balance.  On overflow
+    the job is marked FAILED with error_code "DENSE_TEXT_LIMIT".
+    No credit is deducted in that case.
+
+    Ownership is enforced by filtering on project_id AND current_user.id.
     A valid project_id belonging to another user returns 404 — indistinguishable
     from a non-existent project, preventing enumeration attacks.
     """
@@ -286,7 +329,7 @@ async def process_video(
         )
 
     # ── Pre-flight char-balance awareness (informational, not blocking) ───────
-    tier = PROFITABLE_TIERS.get(plan, PROFITABLE_TIERS["free"])
+    tier           = PROFITABLE_TIERS.get(plan, PROFITABLE_TIERS["free"])
     chars_remaining = current_user.chars_balance or 0
     chars_per_credit = tier["chars_per_credit_minute"]
 
@@ -297,14 +340,20 @@ async def process_video(
             "Dense-speech content will likely be blocked by the pipeline guard."
         )
 
-    # Cross-subtitle gate disabled for testing — all plans use requested value
-    final_subtitle_lang = body.target_subtitle_language
+    # ── Language parameters ───────────────────────────────────────────────────
+    # target_voice_language  → ElevenLabs dubbing language (validates against 32 codes)
+    # target_subtitle_language → subtitle burn language (validates against ~130 codes)
+    #
+    # Both are passed verbatim to the background task.  The pipeline handles the
+    # decoupling; no language routing logic belongs here.
+    voice_lang    = body.target_voice_language
+    subtitle_lang = body.target_subtitle_language
 
     job = RenderJob(
         id=uuid.uuid4(),
         project_id=project.id,
-        target_language=body.target_voice_language,
-        subtitle_language=final_subtitle_lang,
+        target_language=voice_lang,
+        subtitle_language=subtitle_lang,
         status="PENDING",
     )
     db.add(job)
@@ -313,9 +362,10 @@ async def process_video(
 
     logger.info(
         f"[process] job_id={job.id} project_id={project_id} "
-        f"user_id={current_user.id} voice_lang={body.target_voice_language} "
-        f"subtitle_lang={final_subtitle_lang} plan={plan} "
-        f"chars_remaining={chars_remaining}"
+        f"user_id={current_user.id} voice_lang={voice_lang} "
+        f"subtitle_lang={subtitle_lang} plan={plan} "
+        f"chars_remaining={chars_remaining} "
+        f"cross_subtitle={'yes' if voice_lang != subtitle_lang else 'no'}"
     )
 
     background_tasks.add_task(
@@ -324,14 +374,14 @@ async def process_video(
         project_id=str(project.id),
         user_id=str(current_user.id),
         video_local_path=project.original_video_path,
-        target_lang=body.target_voice_language,
-        subtitle_lang=final_subtitle_lang,
+        target_lang=voice_lang,
+        subtitle_lang=subtitle_lang,
     )
 
     return ProcessResponse(
         job_id=str(job.id),
         project_id=str(project.id),
-        target_language=body.target_voice_language,
+        target_language=voice_lang,
         status="PENDING",
         message=f"Render job queued. Poll GET /api/videos/jobs/{job.id} for live status.",
     )
@@ -408,11 +458,11 @@ async def get_tier(current_user: User = Depends(get_current_user)):
     """
     Exposes everything the frontend needs to render the billing/usage section:
 
-    - subscription_plan  — the user's current plan key (e.g. "free", "starter")
-    - tier_label         — human-readable plan name
-    - chars_per_credit   — max transcript chars allowed per 1-credit job on this plan
-    - chars_balance      — the user's remaining character allowance
-    - credit_minutes     — the user's remaining credit minutes
+    - subscription_plan     — the user's current plan key (e.g. "free", "starter")
+    - tier_label            — human-readable plan name
+    - chars_per_credit      — max transcript chars allowed per 1-credit job on this plan
+    - chars_balance         — the user's remaining character allowance
+    - credit_minutes        — the user's remaining credit minutes
     - chars_utilization_pct — how much of the character budget has been used
                               relative to the total that would come with the
                               current credit_minutes balance
@@ -423,7 +473,7 @@ async def get_tier(current_user: User = Depends(get_current_user)):
     chars_per_credit  = tier["chars_per_credit_minute"]
     chars_balance     = current_user.chars_balance or 0
     credit_minutes    = current_user.credit_minutes
-    chars_total_grant = chars_per_credit * credit_minutes  # what a full balance would be
+    chars_total_grant = chars_per_credit * credit_minutes
 
     utilization_pct = (
         round((1 - chars_balance / chars_total_grant) * 100, 1)
@@ -432,13 +482,13 @@ async def get_tier(current_user: User = Depends(get_current_user)):
     )
 
     return {
-        "user_id":             str(current_user.id),
-        "subscription_plan":   plan,
-        "tier_label":          tier["label"],
-        "chars_per_credit":    chars_per_credit,
-        "chars_balance":       chars_balance,
-        "credit_minutes":      credit_minutes,
-        "chars_total_grant":   chars_total_grant,
+        "user_id":               str(current_user.id),
+        "subscription_plan":     plan,
+        "tier_label":            tier["label"],
+        "chars_per_credit":      chars_per_credit,
+        "chars_balance":         chars_balance,
+        "credit_minutes":        credit_minutes,
+        "chars_total_grant":     chars_total_grant,
         "chars_utilization_pct": utilization_pct,
-        "all_tiers":           PROFITABLE_TIERS,
+        "all_tiers":             PROFITABLE_TIERS,
     }
