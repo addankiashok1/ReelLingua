@@ -1,6 +1,6 @@
 import re
 from typing import Optional
-from pydantic import BaseModel, EmailStr, field_validator
+from pydantic import BaseModel, EmailStr, field_validator, model_validator
 
 # Domains that are either placeholder, disposable, or commonly abused in testing.
 # Checked on both signup and login so no blacklisted address can ever authenticate.
@@ -114,7 +114,10 @@ class UserOut(BaseModel):
     user_id: str
     email: str
     credit_minutes: int
+    subscription_plan: str = "free"
+    credit_limit_minutes: int = 2
     phone_number: Optional[str] = None
+    profile_picture_url: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -136,7 +139,9 @@ class ProjectHistoryItem(BaseModel):
     latest_job_id: Optional[str] = None
     latest_job_status: Optional[str] = None
     latest_job_language: Optional[str] = None
+    latest_job_subtitle_language: Optional[str] = None
     output_video_path: Optional[str] = None
+    progress_percentage: int = 0
 
     class Config:
         from_attributes = True
@@ -144,35 +149,47 @@ class ProjectHistoryItem(BaseModel):
 
 # ─── Render Jobs ──────────────────────────────────────────────────────────────
 
-# ElevenLabs Dubbing API supported target languages only
+# ElevenLabs Dubbing API — confirmed supported language set (32 languages)
 _LANG_NAME_TO_CODE: dict[str, str] = {
-    "hindi": "hi", "english": "en", "spanish": "es", "french": "fr",
-    "german": "de", "portuguese": "pt", "italian": "it", "japanese": "ja",
-    "korean": "ko", "chinese": "zh", "arabic": "ar", "russian": "ru",
-    "turkish": "tr", "indonesian": "id", "polish": "pl", "dutch": "nl",
-    "swedish": "sv", "filipino": "fil", "malay": "ms", "romanian": "ro",
-    "ukrainian": "uk",
+    "arabic": "ar", "bulgarian": "bg", "chinese": "zh", "croatian": "hr",
+    "czech": "cs", "danish": "da", "dutch": "nl", "english": "en",
+    "filipino": "fil", "finnish": "fi", "french": "fr", "german": "de",
+    "greek": "el", "hindi": "hi", "hungarian": "hu", "indonesian": "id",
+    "italian": "it", "japanese": "ja", "korean": "ko", "malay": "ms",
+    "norwegian": "no", "polish": "pl", "portuguese": "pt", "romanian": "ro",
+    "russian": "ru", "slovak": "sk", "spanish": "es", "swedish": "sv",
+    "tamil": "ta", "turkish": "tr", "ukrainian": "uk", "vietnamese": "vi",
 }
 
 _SUPPORTED_CODES: set[str] = set(_LANG_NAME_TO_CODE.values())
 
 
-class VideoProcess(BaseModel):
-    target_language: str
+def _validate_lang_code(v: str) -> str:
+    v = v.strip().lower()
+    if v in _LANG_NAME_TO_CODE:
+        v = _LANG_NAME_TO_CODE[v]
+    if v not in _SUPPORTED_CODES:
+        supported = ", ".join(sorted(_SUPPORTED_CODES))
+        raise ValueError(
+            f"'{v}' is not supported by ElevenLabs Dubbing. "
+            f"Supported codes: {supported}"
+        )
+    return v
 
-    @field_validator("target_language")
+
+class VideoProcess(BaseModel):
+    target_voice_language: str
+    target_subtitle_language: str = "en"
+
+    @field_validator("target_voice_language")
     @classmethod
-    def validate_lang(cls, v: str) -> str:
-        v = v.strip().lower()
-        if v in _LANG_NAME_TO_CODE:
-            v = _LANG_NAME_TO_CODE[v]
-        if v not in _SUPPORTED_CODES:
-            supported = ", ".join(sorted(_SUPPORTED_CODES))
-            raise ValueError(
-                f"'{v}' is not supported by ElevenLabs Dubbing. "
-                f"Supported codes: {supported}"
-            )
-        return v
+    def validate_voice_lang(cls, v: str) -> str:
+        return _validate_lang_code(v)
+
+    @field_validator("target_subtitle_language")
+    @classmethod
+    def validate_subtitle_lang(cls, v: str) -> str:
+        return _validate_lang_code(v)
 
 
 class OTPVerify(BaseModel):
@@ -193,6 +210,96 @@ class OTPVerify(BaseModel):
         return v
 
 
+class InitiatePaymentRequest(BaseModel):
+    package_id: str
+
+    @field_validator("package_id")
+    @classmethod
+    def validate_package(cls, v: str) -> str:
+        allowed = {"starter", "creator"}
+        if v not in allowed:
+            raise ValueError(f"package_id must be one of: {sorted(allowed)}")
+        return v
+
+
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+    @field_validator("email", mode="before")
+    @classmethod
+    def normalize_email(cls, v: str) -> str:
+        return _validate_email_domain(v)
+
+
+class ResetPasswordVerify(BaseModel):
+    email: EmailStr
+    otp_code: str
+    new_password: str
+    confirm_new_password: str
+
+    @field_validator("email", mode="before")
+    @classmethod
+    def normalize_email(cls, v: str) -> str:
+        return _validate_email_domain(v)
+
+    @field_validator("otp_code")
+    @classmethod
+    def validate_otp_code(cls, v: str) -> str:
+        v = v.strip()
+        if not re.fullmatch(r"\d{6}", v):
+            raise ValueError("OTP must be exactly 6 digits.")
+        return v
+
+    @field_validator("new_password")
+    @classmethod
+    def new_password_length(cls, v: str) -> str:
+        if len(v) < 6:
+            raise ValueError("Password must be at least 6 characters.")
+        if len(v.encode("utf-8")) > 72:
+            raise ValueError("Password must be 72 characters or fewer.")
+        return v
+
+    @model_validator(mode="after")
+    def passwords_match(self) -> "ResetPasswordVerify":
+        if self.new_password != self.confirm_new_password:
+            raise ValueError("New passwords do not match.")
+        return self
+
+
+class SubscribeRequest(BaseModel):
+    target_plan: str
+
+    @field_validator("target_plan")
+    @classmethod
+    def validate_plan(cls, v: str) -> str:
+        allowed = {"FREE", "STARTER", "CREATOR", "PRO"}
+        v = v.strip().upper()
+        if v not in allowed:
+            raise ValueError(f"target_plan must be one of: {sorted(allowed)}")
+        return v
+
+
+class ChangePassword(BaseModel):
+    current_password: str
+    new_password: str
+    confirm_new_password: str
+
+    @field_validator("new_password")
+    @classmethod
+    def new_password_length(cls, v: str) -> str:
+        if len(v) < 6:
+            raise ValueError("New password must be at least 6 characters.")
+        if len(v.encode("utf-8")) > 72:
+            raise ValueError("New password must be 72 characters or fewer.")
+        return v
+
+    @model_validator(mode="after")
+    def passwords_match(self) -> "ChangePassword":
+        if self.new_password != self.confirm_new_password:
+            raise ValueError("New passwords do not match.")
+        return self
+
+
 class ProcessResponse(BaseModel):
     job_id: str
     project_id: str
@@ -210,3 +317,4 @@ class JobStatusResponse(BaseModel):
     error_message: Optional[str] = None
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
+    progress_percentage: int = 0

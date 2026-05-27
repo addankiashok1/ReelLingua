@@ -2,6 +2,14 @@ import os
 from typing import Optional
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# ─── Subscription tier definitions ───────────────────────────────────────────
+# Imported from billing.py (single source of truth). Lowercase keys map to the
+# subscription_plan values stored in the DB ("free", "starter", "creator", "pro").
+# Imported by: core/pipeline.py, routers/auth.py, routers/payments.py, routers/videos.py
+from billing import FINAL_TIERS as _ft
+PROFITABLE_TIERS: dict[str, dict] = {k.lower(): v for k, v in _ft.items()}
+del _ft
+
 
 class Settings(BaseSettings):
     # Phase 1 — ElevenLabs
@@ -16,8 +24,16 @@ class Settings(BaseSettings):
     supabase_service_role_key: Optional[str] = None
 
     # Phase 3 — PhonePe payment gateway
+    phonepe_merchant_id: str = ""
     phonepe_salt_key: str = ""
     phonepe_salt_index: int = 1
+    # Sandbox: https://api-preprod.phonepe.com/apis/pg-sandbox/pg/v1/pay
+    # Production: https://api.phonepe.com/apis/hermes/pg/v1/pay
+    phonepe_api_url: str = "https://api-preprod.phonepe.com/apis/pg-sandbox/pg/v1/pay"
+    # Backend public origin (used as callbackUrl sent to PhonePe)
+    base_url: str = "http://localhost:8000"
+    # Frontend public origin (used as redirectUrl after payment)
+    frontend_url: str = "http://localhost:3000"
 
     # Phase 4 — Gmail SMTP for OTP emails
     smtp_user: str = ""

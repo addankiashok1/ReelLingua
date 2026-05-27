@@ -19,11 +19,20 @@ class AIOrchestrator:
         self.client = ElevenLabs(api_key=config.ELEVENLABS_API_KEY)
 
     def generate_dubbed_audio(
-        self, video_path: str, target_lang: str, output_dir: str
+        self,
+        video_path: str,
+        target_lang: str,
+        output_dir: str,
+        subtitle_lang: str | None = None,
     ) -> tuple[str, list[dict]]:
         """
         Submits video to ElevenLabs Dubbing API, waits for completion,
         then downloads the dubbed MP3 and SRT subtitle file.
+
+        subtitle_lang: language code to use for subtitle download.  When it
+        differs from target_lang (cross-subtitle mode), the SRT is requested in
+        subtitle_lang first; if ElevenLabs does not have that transcript (e.g.
+        the language was not dubbed), we fall back to target_lang.
 
         Returns:
             (dubbed_audio_path, subtitles_data)
@@ -45,9 +54,29 @@ class AIOrchestrator:
         self._wait_for_completion(dubbing_id)
 
         audio_path = self._download_dubbed_audio(dubbing_id, target_lang, output_dir)
-        subtitles_data = self._download_subtitles(dubbing_id, target_lang, output_dir)
 
-        return audio_path, subtitles_data
+        effective_sub_lang = subtitle_lang or target_lang
+        if effective_sub_lang != target_lang:
+            try:
+                subtitles_data = self._download_subtitles(dubbing_id, effective_sub_lang, output_dir)
+                logger.info(
+                    f"Cross-subtitle: downloaded SRT in '{effective_sub_lang}' "
+                    f"(audio is '{target_lang}')"
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"Could not fetch subtitles in '{effective_sub_lang}' "
+                    f"({exc}) — falling back to '{target_lang}'"
+                )
+                subtitles_data = self._download_subtitles(dubbing_id, target_lang, output_dir)
+                effective_sub_lang = target_lang  # font must match actual text language
+        else:
+            subtitles_data = self._download_subtitles(dubbing_id, target_lang, output_dir)
+
+        # Return the ACTUAL subtitle language used (may differ from requested
+        # subtitle_lang when fallback occurred) so the caller can pick the
+        # correct font for burning.
+        return audio_path, subtitles_data, effective_sub_lang
 
     def _wait_for_completion(self, dubbing_id: str) -> None:
         elapsed = 0

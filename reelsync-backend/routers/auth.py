@@ -12,11 +12,20 @@ from sqlalchemy import delete, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from config import settings
+from billing import BILLING_TIERS, plan_from_db
+from config import PROFITABLE_TIERS, settings
 from database import get_db
-from models.db_models import OTPVerification, User
-from models.schemas import OTPVerify, Token, UserCreate, UserLogin, UserOut
-from utils.email import send_otp_email
+from models.db_models import OTPVerification, PasswordResetOTP, User
+from models.schemas import (
+    ForgotPasswordRequest,
+    OTPVerify,
+    ResetPasswordVerify,
+    Token,
+    UserCreate,
+    UserLogin,
+    UserOut,
+)
+from utils.email import send_otp_email, send_password_reset_email
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -229,12 +238,15 @@ async def verify_otp(body: OTPVerify, db: AsyncSession = Depends(get_db)):
     # OTP correct — final duplicate guard against race conditions
     await _check_conflicts(db, record.email, record.phone_number)
 
+    _INITIAL_CREDITS = 3
     new_user = User(
         id=uuid.uuid4(),
         email=record.email,
         phone_number=record.phone_number,
         hashed_password=record.hashed_password,
-        credit_minutes=3,
+        credit_minutes=_INITIAL_CREDITS,
+        subscription_plan="free",
+        chars_balance=PROFITABLE_TIERS["free"]["chars_per_credit_minute"] * _INITIAL_CREDITS,
     )
 
     try:
@@ -298,9 +310,137 @@ async def login(body: UserLogin, db: AsyncSession = Depends(get_db)):
     summary="Return the authenticated user's profile",
 )
 async def me(current_user: User = Depends(get_current_user)):
+    plan_key = plan_from_db(current_user.subscription_plan)  # uppercase e.g. "FREE"
+    tier = BILLING_TIERS.get(plan_key, BILLING_TIERS["FREE"])
     return UserOut(
         user_id=str(current_user.id),
         email=current_user.email,
         credit_minutes=current_user.credit_minutes,
+        subscription_plan=current_user.subscription_plan or "free",
+        credit_limit_minutes=tier["min_limit"],
         phone_number=current_user.phone_number,
+        profile_picture_url=current_user.profile_picture_url,
     )
+
+
+# ─── POST /forgot-password-request ───────────────────────────────────────────
+
+@router.post(
+    "/forgot-password-request",
+    status_code=status.HTTP_200_OK,
+    summary="Send a 6-digit password-reset OTP to the given email address",
+)
+async def forgot_password_request(
+    body: ForgotPasswordRequest,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Always returns 200 regardless of whether the email is registered —
+    this prevents account enumeration. The OTP is only sent when the
+    email matches a real user.
+    """
+    _SAFE_RESPONSE = {"message": "If that email is registered, a reset code has been sent."}
+
+    result = await db.execute(select(User).where(User.email == body.email))
+    user: Optional[User] = result.scalar_one_or_none()
+
+    if not user:
+        logger.info(f"[forgot-password] no account for {body.email} — silent no-op")
+        return _SAFE_RESPONSE
+
+    otp_code = f"{secrets.randbelow(10 ** 6):06d}"
+    expires_at = datetime.now(timezone.utc) + timedelta(minutes=OTP_EXPIRE_MINUTES)
+
+    # Atomic upsert: replace any existing reset OTP for this email
+    await db.execute(
+        delete(PasswordResetOTP).where(PasswordResetOTP.email == body.email)
+    )
+    db.add(PasswordResetOTP(
+        id=uuid.uuid4(),
+        email=body.email,
+        otp_code=otp_code,
+        expires_at=expires_at,
+    ))
+    await db.commit()
+
+    background_tasks.add_task(send_password_reset_email, body.email, otp_code)
+    logger.info(f"[forgot-password] reset OTP queued for {body.email}")
+    return _SAFE_RESPONSE
+
+
+# ─── POST /reset-password-verify ─────────────────────────────────────────────
+
+@router.post(
+    "/reset-password-verify",
+    status_code=status.HTTP_200_OK,
+    summary="Verify the reset OTP and update the user's password",
+)
+async def reset_password_verify(
+    body: ResetPasswordVerify,
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(PasswordResetOTP).where(PasswordResetOTP.email == body.email)
+    )
+    record: Optional[PasswordResetOTP] = result.scalar_one_or_none()
+
+    if not record:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No pending reset found for this email. Please request a new code.",
+        )
+
+    # Normalise to UTC-aware before comparison
+    expires = record.expires_at
+    if expires.tzinfo is None:
+        expires = expires.replace(tzinfo=timezone.utc)
+
+    if expires < datetime.now(timezone.utc):
+        await db.delete(record)
+        await db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Reset code has expired. Please request a new one.",
+        )
+
+    if record.attempt_count >= OTP_MAX_ATTEMPTS:
+        await db.delete(record)
+        await db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Too many incorrect attempts. Please request a new reset code.",
+        )
+
+    if record.otp_code != body.otp_code:
+        record.attempt_count += 1
+        await db.commit()
+        remaining = OTP_MAX_ATTEMPTS - record.attempt_count
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Incorrect code. "
+                f"{remaining} attempt{'s' if remaining != 1 else ''} remaining."
+            ),
+        )
+
+    # OTP correct — update the user's password
+    user_result = await db.execute(select(User).where(User.email == body.email))
+    user: Optional[User] = user_result.scalar_one_or_none()
+    if not user:
+        # Guard against the extremely unlikely case of account deletion between
+        # the forgot-password-request and verify calls.
+        await db.delete(record)
+        await db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Account not found.",
+        )
+
+    user.hashed_password = hash_password(body.new_password)
+    db.add(user)
+    await db.delete(record)
+    await db.commit()
+
+    logger.info(f"[reset-password] password updated for user_id={user.id}")
+    return {"message": "Password updated successfully."}

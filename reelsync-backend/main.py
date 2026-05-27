@@ -5,6 +5,7 @@ import uuid
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from jose import JWTError, jwt
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -12,8 +13,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 import config
 from config import settings
 from database import engine, get_db
-from models.db_models import Base, OTPVerification, User  # noqa: F401 — registers models with Base
-from routers import auth, payments, videos
+from models.db_models import Base, OTPVerification, PasswordResetOTP, PaymentTransaction, User  # noqa: F401 — registers models with Base
+from routers import auth, payments, user, videos
 from routers.auth import ALGORITHM
 
 logging.basicConfig(
@@ -25,6 +26,7 @@ logging.basicConfig(
 os.makedirs(config.TEMP_DIR, exist_ok=True)
 os.makedirs(os.path.join(config.STORAGE_DIR, "inputs"), exist_ok=True)
 os.makedirs(os.path.join(config.STORAGE_DIR, "outputs"), exist_ok=True)
+os.makedirs(os.path.join(config.STORAGE_DIR, "profiles"), exist_ok=True)
 
 app = FastAPI(
     title="ReelSync AI",
@@ -50,6 +52,13 @@ app.add_middleware(
 app.include_router(auth.router,     prefix="/api/auth",     tags=["Authentication"])
 app.include_router(videos.router,   prefix="/api/videos",   tags=["Videos"])
 app.include_router(payments.router, prefix="/api/payments", tags=["Payments"])
+app.include_router(user.router,     prefix="/api/user",     tags=["User"])
+
+app.mount(
+    "/profiles",
+    StaticFiles(directory=os.path.join(config.STORAGE_DIR, "profiles")),
+    name="profiles",
+)
 
 
 # ─── Authenticated video download ─────────────────────────────────────────────
@@ -125,6 +134,37 @@ async def create_tables() -> None:
         ))
         await conn.execute(text(
             "CREATE INDEX IF NOT EXISTS ix_users_phone_number ON users(phone_number)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS profile_picture_url VARCHAR(500)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS "
+            "subscription_plan VARCHAR(50) NOT NULL DEFAULT 'free'"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS "
+            "chars_balance INTEGER NOT NULL DEFAULT 0"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE render_jobs ADD COLUMN IF NOT EXISTS "
+            "subtitle_language VARCHAR(10)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE render_jobs ADD COLUMN IF NOT EXISTS "
+            "progress_percentage INTEGER NOT NULL DEFAULT 0"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE render_jobs "
+            "ALTER COLUMN status TYPE VARCHAR(30)"
+        ))
+        # One-time backfill: users created before the chars_balance column was
+        # added received DEFAULT 0.  Restore their budget based on remaining
+        # credit_minutes so the character-density guard doesn't block them.
+        await conn.execute(text(
+            "UPDATE users "
+            "SET chars_balance = credit_minutes * 750 "
+            "WHERE chars_balance = 0 AND credit_minutes > 0"
         ))
     logging.getLogger(__name__).info("Database tables and columns verified.")
 

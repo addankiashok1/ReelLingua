@@ -50,6 +50,7 @@ export default function SignupPage() {
   const [password, setPassword] = useState('')
   const [confirmPassword, setConfirmPassword] = useState('')
   const [phone, setPhone] = useState('')
+  const [termsAccepted, setTermsAccepted] = useState(false)
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
 
@@ -89,6 +90,10 @@ export default function SignupPage() {
     e.preventDefault()
     setError('')
 
+    if (!termsAccepted) {
+      setError('You must accept the voice cloning terms and conditions to create an account.')
+      return
+    }
     const emailError = validateEmail(email)
     if (emailError) { setError(emailError); return }
     if (password !== confirmPassword) { setError('Passwords do not match.'); return }
@@ -364,6 +369,35 @@ export default function SignupPage() {
               />
             </div>
 
+            {/* T&C consent */}
+            <div
+              className={`flex items-start gap-3 p-3.5 rounded-xl border transition-colors cursor-pointer ${
+                termsAccepted ? 'bg-indigo-50 border-indigo-200' : 'bg-amber-50 border-amber-200'
+              }`}
+              onClick={() => setTermsAccepted(v => !v)}
+            >
+              <input
+                type="checkbox"
+                id="terms-accepted"
+                checked={termsAccepted}
+                onChange={e => setTermsAccepted(e.target.checked)}
+                className="mt-0.5 w-4 h-4 accent-indigo-600 cursor-pointer"
+                onClick={e => e.stopPropagation()}
+              />
+              <label htmlFor="terms-accepted" className="text-xs text-gray-700 leading-relaxed cursor-pointer select-none">
+                I confirm I will only use my own voice or have explicit written permission from the voice rights holder
+                to use AI voice dubbing. By creating this account I agree to the{' '}
+                <a href="https://reelsyncai.com/terms" target="_blank" rel="noopener noreferrer"
+                  className="text-indigo-600 hover:underline font-medium" onClick={e => e.stopPropagation()}>
+                  Terms of Service
+                </a>{' '}and{' '}
+                <a href="https://reelsyncai.com/privacy" target="_blank" rel="noopener noreferrer"
+                  className="text-indigo-600 hover:underline font-medium" onClick={e => e.stopPropagation()}>
+                  Privacy Policy
+                </a>.
+              </label>
+            </div>
+
             {error && (
               <div className="bg-red-50 border border-red-200 text-red-700 text-sm rounded-lg px-4 py-3">
                 {error}
@@ -372,7 +406,7 @@ export default function SignupPage() {
 
             <button
               type="submit"
-              disabled={loading}
+              disabled={loading || !termsAccepted}
               className="w-full bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-400 text-white font-semibold py-2.5 rounded-xl transition-colors text-sm mt-2"
             >
               {loading ? (
