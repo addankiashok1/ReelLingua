@@ -446,3 +446,157 @@ class JobStatusResponse(BaseModel):
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
     progress_percentage: int = 0
+
+
+# ─── Workspace: Folders ───────────────────────────────────────────────────────
+
+class FolderCreate(BaseModel):
+    name: str
+
+    @field_validator("name")
+    @classmethod
+    def name_not_empty(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("Folder name cannot be empty.")
+        return v
+
+
+class FolderRename(BaseModel):
+    name: str
+
+    @field_validator("name")
+    @classmethod
+    def name_not_empty(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("Folder name cannot be empty.")
+        return v
+
+
+class FolderResponse(BaseModel):
+    folder_id: str
+    name: str
+    created_at: str
+    project_count: int = 0
+
+
+# ─── Workspace: Projects ──────────────────────────────────────────────────────
+
+class WorkspaceProjectCreate(BaseModel):
+    name: str
+
+    @field_validator("name")
+    @classmethod
+    def name_not_empty(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("Folder name cannot be empty.")
+        return v
+
+
+class WorkspaceProjectRename(BaseModel):
+    name: str
+
+    @field_validator("name")
+    @classmethod
+    def name_not_empty(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("Folder name cannot be empty.")
+        return v
+
+
+class WorkspaceProjectResponse(BaseModel):
+    project_id: str
+    name: str
+    created_at: str
+
+
+class WorkspaceRootResponse(BaseModel):
+    folders: list[FolderResponse]
+    projects: list[WorkspaceProjectResponse]
+
+
+# ─── Workspace: Scene / Render-job detail ─────────────────────────────────────
+
+class SceneItem(BaseModel):
+    job_id: str
+    project_id: str
+    folder_id: Optional[str] = None       # explorer folder this scene lives in; None = project root
+    scene_name: Optional[str] = None
+    target_voice_lang: str
+    target_subtitle_lang: Optional[str] = None
+    source_language: Optional[str] = None
+    status: str
+    progress_percentage: int = 0
+    output_video_path: Optional[str] = None
+    error_message: Optional[str] = None
+    created_at: str
+    updated_at: str
+
+
+class ProjectDetailResponse(BaseModel):
+    project_id: str
+    name: str
+    folder_id: Optional[str] = None
+    target_voice_lang: Optional[str] = None
+    target_subtitle_lang: Optional[str] = None
+    created_at: str
+    scenes: list[SceneItem]
+
+
+# ─── Explorer: recursive folder + scene system ────────────────────────────────
+
+class ExplorerFolderItem(BaseModel):
+    folder_id: str
+    project_id: str
+    parent_id: Optional[str] = None
+    name: str
+    created_at: str
+
+
+class ExplorerContentsResponse(BaseModel):
+    project_id: str
+    project_name: str
+    current_folder_id: Optional[str] = None
+    folders: list[ExplorerFolderItem]
+    scenes: list[SceneItem]
+
+
+class ExplorerFolderCreate(BaseModel):
+    project_id: str
+    parent_id: Optional[str] = None
+    name: str
+
+    @field_validator("name")
+    @classmethod
+    def name_not_empty(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("Folder name cannot be empty.")
+        return v
+
+
+class ExplorerFolderRename(BaseModel):
+    name: str
+
+    @field_validator("name")
+    @classmethod
+    def name_not_empty(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("Folder name cannot be empty.")
+        return v
+
+
+class SceneRename(BaseModel):
+    scene_name: str
+
+    @field_validator("scene_name")
+    @classmethod
+    def name_not_empty(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("Scene name cannot be empty.")
+        return v

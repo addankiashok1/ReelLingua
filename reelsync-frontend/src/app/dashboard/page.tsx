@@ -1176,12 +1176,6 @@ export default function DashboardPage() {
               Drop a video, choose a language, and launch directly — no page change required
             </p>
           </div>
-          <Link
-            href="/dashboard/sync"
-            className="text-xs font-semibold text-indigo-400 hover:text-indigo-300 transition-colors"
-          >
-            Full Studio →
-          </Link>
         </div>
 
         <div className="p-6 grid md:grid-cols-[1fr_280px] gap-5">

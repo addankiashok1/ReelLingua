@@ -72,6 +72,7 @@ async def _list_projects(
     result = await db.execute(
         select(Project)
         .where(Project.user_id == current_user.id)
+        .where(Project.is_workspace == False)  # noqa: E712 — exclude Projects workspace entries
         .order_by(Project.created_at.desc())
     )
     projects = result.scalars().all()

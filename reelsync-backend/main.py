@@ -13,8 +13,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 import config
 from config import settings
 from database import engine, get_db
-from models.db_models import Base, OTPVerification, PasswordResetOTP, PaymentTransaction, User  # noqa: F401 — registers models with Base
+from models.db_models import Base, ExplorerFolder, Folder, OTPVerification, PasswordResetOTP, PaymentTransaction, User  # noqa: F401 — registers models with Base
 from routers import auth, payments, user, videos
+from routers import explorer, projects
 from routers.auth import ALGORITHM
 
 logging.basicConfig(
@@ -53,6 +54,8 @@ app.include_router(auth.router,     prefix="/api/auth",     tags=["Authenticatio
 app.include_router(videos.router,   prefix="/api/videos",   tags=["Videos"])
 app.include_router(payments.router, prefix="/api/payments", tags=["Payments"])
 app.include_router(user.router,     prefix="/api/user",     tags=["User"])
+app.include_router(projects.router, prefix="/api",          tags=["Projects & Folders"])
+app.include_router(explorer.router, prefix="/api",          tags=["Explorer"])
 
 app.mount(
     "/profiles",
@@ -165,6 +168,63 @@ async def create_tables() -> None:
             "UPDATE users "
             "SET chars_balance = credit_minutes * 750 "
             "WHERE chars_balance = 0 AND credit_minutes > 0"
+        ))
+        # ── Projects & Folders workspace migration ──────────────────────────
+        # folders table (created by Base.metadata.create_all above if not present,
+        # but we add an explicit index guard for existing deployments)
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_folders_user_id ON folders(user_id)"
+        ))
+        # Add folder_id FK to projects (nullable — existing rows keep NULL = root level)
+        await conn.execute(text(
+            "ALTER TABLE projects ADD COLUMN IF NOT EXISTS "
+            "folder_id UUID REFERENCES folders(id) ON DELETE SET NULL"
+        ))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_projects_folder_id ON projects(folder_id)"
+        ))
+        # Add per-project language defaults
+        await conn.execute(text(
+            "ALTER TABLE projects ADD COLUMN IF NOT EXISTS target_voice_lang VARCHAR(10)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE projects ADD COLUMN IF NOT EXISTS target_subtitle_lang VARCHAR(10)"
+        ))
+        # Make original_video_path nullable (workspace projects exist before video upload)
+        await conn.execute(text(
+            "ALTER TABLE projects ALTER COLUMN original_video_path DROP NOT NULL"
+        ))
+        # render_jobs.source_language was added in a prior migration; guard it
+        await conn.execute(text(
+            "ALTER TABLE render_jobs ADD COLUMN IF NOT EXISTS source_language VARCHAR(10)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE render_jobs ADD COLUMN IF NOT EXISTS scene_name VARCHAR(255)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE render_jobs ADD COLUMN IF NOT EXISTS input_video_path VARCHAR"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE projects ADD COLUMN IF NOT EXISTS "
+            "is_workspace BOOLEAN NOT NULL DEFAULT FALSE"
+        ))
+        # ── Explorer: recursive folder tree ────────────────────────────────────
+        # explorer_folders is created by create_all above; guard indexes only
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_explorer_folders_project_id "
+            "ON explorer_folders(project_id)"
+        ))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_explorer_folders_parent_id "
+            "ON explorer_folders(parent_id)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE render_jobs ADD COLUMN IF NOT EXISTS "
+            "folder_id UUID REFERENCES explorer_folders(id) ON DELETE CASCADE"
+        ))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_render_jobs_folder_id "
+            "ON render_jobs(folder_id)"
         ))
     logging.getLogger(__name__).info("Database tables and columns verified.")
 
