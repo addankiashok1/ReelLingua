@@ -31,17 +31,21 @@ from fastapi import (
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from config import STORAGE_DIR
+from config import STORAGE_DIR, THUMBNAILS_DIR
 from core.pipeline import run_background_job
 from database import get_db
-from models.db_models import ExplorerFolder, Project, RenderJob, User
+from models.db_models import ExplorerFolder, Project, RenderJob, SceneEditHistory, User
 from models.schemas import (
     ExplorerContentsResponse,
     ExplorerFolderCreate,
     ExplorerFolderItem,
     ExplorerFolderRename,
+    FolderMoveBody,
     ProcessResponse,
+    SceneHistoryItem,
     SceneItem,
+    SceneMoveBody,
+    SceneReprocessBody,
     SceneRename,
 )
 from routers.auth import get_current_user
@@ -91,6 +95,17 @@ def _folder_item(f: ExplorerFolder) -> ExplorerFolderItem:
 
 
 def _scene_item(j: RenderJob) -> SceneItem:
+    # Derive the public thumbnail URL from the stored filesystem path.
+    # thumbnail_path: {THUMBNAILS_DIR}/{user_id}/{job_id}.jpg
+    # served at:      /thumbnails/{user_id}/{job_id}.jpg
+    thumbnail_url: str | None = None
+    if j.thumbnail_path and os.path.isfile(j.thumbnail_path):
+        try:
+            rel = os.path.relpath(j.thumbnail_path, THUMBNAILS_DIR)
+            thumbnail_url = "/thumbnails/" + rel.replace(os.sep, "/")
+        except ValueError:
+            pass
+
     return SceneItem(
         job_id=str(j.id),
         project_id=str(j.project_id),
@@ -101,7 +116,10 @@ def _scene_item(j: RenderJob) -> SceneItem:
         source_language=j.source_language,
         status=j.status,
         progress_percentage=j.progress_percentage,
+        input_video_path=j.input_video_path,
         output_video_path=j.output_video_path,
+        thumbnail_path=j.thumbnail_path,
+        thumbnail_url=thumbnail_url,
         error_message=j.error_message,
         created_at=str(j.created_at),
         updated_at=str(j.updated_at),
@@ -139,20 +157,22 @@ async def get_contents(
         if not check or check.project_id != pid:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Folder not found in this project.")
 
-    # Folders at this level
+    # Folders at this level — exclude trashed folders
     folder_result = await db.execute(
         select(ExplorerFolder)
         .where(ExplorerFolder.project_id == pid)
         .where(ExplorerFolder.parent_id == current_fid)   # None → IS NULL
+        .where(ExplorerFolder.trashed_at.is_(None))
         .order_by(ExplorerFolder.name.asc())
     )
     folders = folder_result.scalars().all()
 
-    # Scenes (render_jobs) at this level
+    # Scenes (render_jobs) at this level — exclude trashed scenes
     scene_result = await db.execute(
         select(RenderJob)
         .where(RenderJob.project_id == pid)
         .where(RenderJob.folder_id == current_fid)        # None → IS NULL
+        .where(RenderJob.trashed_at.is_(None))
         .order_by(RenderJob.created_at.desc())
     )
     scenes = scene_result.scalars().all()
@@ -422,6 +442,102 @@ async def rename_scene(
     return _scene_item(job)
 
 
+# ─── PATCH /folders/{folder_id}/move ─────────────────────────────────────────
+
+@router.patch(
+    "/folders/{folder_id}/move",
+    response_model=ExplorerFolderItem,
+    summary="Move a folder to another folder or to project root",
+)
+async def move_folder(
+    folder_id: str,
+    body: FolderMoveBody,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    try:
+        fid = uuid.UUID(folder_id)
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid folder_id.")
+
+    folder = await _get_explorer_folder(fid, current_user, db)
+
+    target_fid: Optional[uuid.UUID] = None
+    if body.target_folder_id:
+        try:
+            target_fid = uuid.UUID(body.target_folder_id)
+        except ValueError:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid target_folder_id.")
+
+        if target_fid == fid:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot move a folder into itself.")
+
+        target: Optional[ExplorerFolder] = await db.get(ExplorerFolder, target_fid)
+        if not target or target.project_id != folder.project_id:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Target folder not found.")
+
+        # Prevent moving into a descendant (circular reference)
+        rows = await db.execute(
+            text("""
+                WITH RECURSIVE tree AS (
+                    SELECT id FROM explorer_folders WHERE id = :fid
+                    UNION ALL
+                    SELECT f.id FROM explorer_folders f JOIN tree t ON f.parent_id = t.id
+                )
+                SELECT 1 FROM tree WHERE id = :target_fid
+            """),
+            {"fid": fid, "target_fid": target_fid},
+        )
+        if rows.fetchone():
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot move a folder into its own descendant.")
+
+    folder.parent_id = target_fid
+    await db.commit()
+    await db.refresh(folder)
+    logger.info(f"[explorer] folder moved id={fid} → parent={target_fid}")
+    return _folder_item(folder)
+
+
+# ─── PATCH /scenes/{scene_id}/move ───────────────────────────────────────────
+
+@router.patch(
+    "/scenes/{scene_id}/move",
+    response_model=SceneItem,
+    summary="Move a scene to a folder or to project root",
+)
+async def move_scene(
+    scene_id: str,
+    body: SceneMoveBody,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    try:
+        sid = uuid.UUID(scene_id)
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid scene_id.")
+
+    job: Optional[RenderJob] = await db.get(RenderJob, sid)
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scene not found.")
+    await _get_workspace_project(job.project_id, current_user, db)
+
+    target_fid: Optional[uuid.UUID] = None
+    if body.target_folder_id:
+        try:
+            target_fid = uuid.UUID(body.target_folder_id)
+        except ValueError:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid target_folder_id.")
+        target: Optional[ExplorerFolder] = await db.get(ExplorerFolder, target_fid)
+        if not target or target.project_id != job.project_id:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Target folder not found.")
+
+    job.folder_id = target_fid
+    await db.commit()
+    await db.refresh(job)
+    logger.info(f"[explorer] scene moved id={sid} → folder={target_fid}")
+    return _scene_item(job)
+
+
 # ─── DELETE /scenes/{scene_id} ────────────────────────────────────────────────
 
 @router.delete(
@@ -455,3 +571,140 @@ async def delete_scene(
     await db.delete(job)
     await db.commit()
     logger.info(f"[explorer] scene deleted id={scene_id}")
+
+
+# ─── POST /scenes/{scene_id}/reprocess ───────────────────────────────────────
+
+@router.post(
+    "/scenes/{scene_id}/reprocess",
+    response_model=SceneItem,
+    summary="Change language settings and re-queue a scene for processing",
+)
+async def reprocess_scene(
+    scene_id: str,
+    body: SceneReprocessBody,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    try:
+        sid = uuid.UUID(scene_id)
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid scene_id.")
+
+    job: Optional[RenderJob] = await db.get(RenderJob, sid)
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scene not found.")
+
+    await _get_workspace_project(job.project_id, current_user, db)
+
+    if not job.input_video_path or not os.path.isfile(job.input_video_path):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Original video file is no longer available for reprocessing.",
+        )
+
+    plan = (current_user.subscription_plan or "free").lower()
+    if plan != "free" and current_user.credit_minutes < 1:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail=f"Insufficient credits ({current_user.credit_minutes} remaining).",
+        )
+
+    # Save current settings + file paths to history before overwriting.
+    # We deliberately keep the old output file on disk so users can still
+    # play and download previous versions from the history rows.
+    history_entry = SceneEditHistory(
+        id=uuid.uuid4(),
+        scene_id=job.id,
+        target_voice_lang=job.target_language,
+        target_subtitle_lang=job.subtitle_language,
+        source_language=job.source_language,
+        output_video_path=job.output_video_path,
+        thumbnail_path=job.thumbnail_path,
+    )
+    db.add(history_entry)
+
+    # Update job with new language settings and reset pipeline state
+    job.target_language = body.target_voice_lang
+    job.subtitle_language = body.target_subtitle_lang
+    job.source_language = body.source_language
+    job.status = "PENDING"
+    job.progress_percentage = 0
+    job.output_video_path = None
+    job.thumbnail_path = None
+    job.error_message = None
+
+    await db.commit()
+    await db.refresh(job)
+
+    background_tasks.add_task(
+        run_background_job,
+        job_id=str(job.id),
+        project_id=str(job.project_id),
+        user_id=str(current_user.id),
+        video_local_path=job.input_video_path,
+        target_lang=body.target_voice_lang,
+        subtitle_lang=body.target_subtitle_lang or "en",
+        source_lang=body.source_language,
+        scene_name=job.scene_name or "",
+    )
+
+    logger.info(
+        f"[explorer] scene reprocessed id={sid} "
+        f"voice={body.target_voice_lang} subtitle={body.target_subtitle_lang}"
+    )
+    return _scene_item(job)
+
+
+# ─── GET /scenes/{scene_id}/history ──────────────────────────────────────────
+
+@router.get(
+    "/scenes/{scene_id}/history",
+    response_model=list[SceneHistoryItem],
+    summary="Get the language-change history for a scene",
+)
+async def get_scene_history(
+    scene_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    try:
+        sid = uuid.UUID(scene_id)
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid scene_id.")
+
+    job: Optional[RenderJob] = await db.get(RenderJob, sid)
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scene not found.")
+
+    await _get_workspace_project(job.project_id, current_user, db)
+
+    rows = await db.execute(
+        select(SceneEditHistory)
+        .where(SceneEditHistory.scene_id == sid)
+        .order_by(SceneEditHistory.created_at.desc())
+    )
+    entries = rows.scalars().all()
+
+    def _history_thumb_url(path: str | None) -> str | None:
+        if not path or not os.path.isfile(path):
+            return None
+        try:
+            rel = os.path.relpath(path, THUMBNAILS_DIR)
+            return "/thumbnails/" + rel.replace(os.sep, "/")
+        except ValueError:
+            return None
+
+    return [
+        SceneHistoryItem(
+            id=str(e.id),
+            target_voice_lang=e.target_voice_lang,
+            target_subtitle_lang=e.target_subtitle_lang,
+            source_language=e.source_language,
+            output_video_path=e.output_video_path,
+            thumbnail_path=_history_thumb_url(e.thumbnail_path),
+            created_at=str(e.created_at),
+        )
+        for e in entries
+    ]

@@ -26,7 +26,7 @@ from sqlalchemy import update
 
 import config
 from config import MAX_CONCURRENT_JOBS, PROFITABLE_TIERS
-from core.ai_client import AIOrchestrator, parse_srt
+from core.ai_client import get_orchestrator, parse_srt
 from core.subtitle_translator import translate_srt_file, translate_subtitles_data
 from core.video_processor import VideoEngine
 
@@ -147,19 +147,32 @@ async def run_background_job(
             await set_status("STARTED", progress_percentage=5)
             logger.info(f"[pipeline] job={job_id} → STARTED")
 
+            # ── Pre-flight: read subscription plan so apply_watermark is ready ─
+            # The char-guard later does its own fresh read for chars_balance.
+            async with AsyncSessionLocal() as _pre_session:
+                _pre_user: Optional[User] = await _pre_session.get(User, uuid.UUID(user_id))
+                if not _pre_user:
+                    raise RuntimeError(f"[pipeline] User {user_id} not found — aborting job.")
+                plan: str       = (_pre_user.subscription_plan or "free").lower()
+                apply_watermark = (plan == "free")
+            logger.info(
+                f"[pipeline] job={job_id} plan={plan} apply_watermark={apply_watermark}"
+            )
+
             # ── Milestone 2: EXTRACTED_AUDIO (20%) — submitting to ElevenLabs ────
             # Status is set before the blocking call so the UI immediately reflects
             # that audio extraction is underway while the thread is running.
             await set_status("EXTRACTED_AUDIO", progress_percentage=20)
             logger.info(f"[pipeline] job={job_id} → EXTRACTED_AUDIO  (submitting to ElevenLabs)")
 
-            ai = AIOrchestrator()
+            ai = get_orchestrator()
             dubbed_audio_path, subtitles_data, detected_src_lang = await asyncio.to_thread(
                 ai.generate_dubbed_audio,
                 video_local_path,
                 target_lang,
                 job_temp_dir,
                 source_lang,
+                apply_watermark,
             )
 
             # ── Milestone 3: CLONED_AUDIO (45%) — ElevenLabs returned ────────────
@@ -292,7 +305,9 @@ async def run_background_job(
                     raise RuntimeError(
                         f"[pipeline] User {user_id} disappeared during char check — aborting job."
                     )
-                plan: str            = (user_check.subscription_plan or "free").lower()
+                # Re-read plan in case it changed during the long ElevenLabs call,
+                # and get the freshest chars_balance for the density guard.
+                plan              = (user_check.subscription_plan or "free").lower()
                 chars_remaining: int = user_check.chars_balance or 0
 
             tier = PROFITABLE_TIERS.get(plan, PROFITABLE_TIERS["free"])
@@ -326,7 +341,6 @@ async def run_background_job(
             await set_status("APPENDING_TO_VIDEO", progress_percentage=80)
             logger.info(f"[pipeline] job={job_id} → APPENDING_TO_VIDEO")
 
-            apply_watermark = (plan == "free")
             if apply_watermark:
                 logger.info(f"[pipeline] job={job_id} free-tier — watermark will be applied")
 
@@ -349,8 +363,22 @@ async def run_background_job(
             archived_path = _archive_output(user_id, job_id, final_local_path, scene_name)
             logger.info(f"[pipeline] job={job_id} archived → {archived_path}")
 
+            # ── Thumbnail extraction (non-fatal) ─────────────────────────────
+            thumb_dir = os.path.join(config.THUMBNAILS_DIR, user_id)
+            os.makedirs(thumb_dir, exist_ok=True)
+            thumb_path = os.path.join(thumb_dir, f"{job_id}.jpg")
+            thumb_ok = await asyncio.to_thread(_extract_thumbnail, archived_path, thumb_path)
+            if thumb_ok:
+                logger.info(f"[pipeline] job={job_id} thumbnail → {thumb_path}")
+            else:
+                logger.warning(f"[pipeline] job={job_id} thumbnail extraction failed (non-fatal)")
+                thumb_path = None
+
             # ── Milestone 7: COMPLETED (100%) ────────────────────────────────
-            await set_status("COMPLETED", progress_percentage=100, output_video_path=archived_path)
+            completed_fields: dict = {"output_video_path": archived_path}
+            if thumb_path:
+                completed_fields["thumbnail_path"] = thumb_path
+            await set_status("COMPLETED", progress_percentage=100, **completed_fields)
             logger.info(f"[pipeline] job={job_id} → COMPLETED")
 
             # ── Atomic dual deduction (skipped for free plan) ─────────────────
@@ -435,6 +463,32 @@ def _burn_video(
         target_lang=subtitle_lang or target_lang,
         watermark=watermark,
     )
+
+
+def _extract_thumbnail(video_path: str, thumbnail_path: str) -> bool:
+    """Extract a JPEG thumbnail via ffmpeg. Tries at 1 s; falls back to 0 s for short clips."""
+    import subprocess
+    for seek in ("00:00:01", "00:00:00"):
+        try:
+            result = subprocess.run(
+                [
+                    "ffmpeg", "-y",
+                    "-ss", seek,
+                    "-i", video_path,
+                    "-vframes", "1",
+                    "-q:v", "2",
+                    "-update", "1",   # write a single image, not a sequence
+                    thumbnail_path,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=30,
+            )
+            if result.returncode == 0 and os.path.isfile(thumbnail_path):
+                return True
+        except Exception:
+            pass
+    return False
 
 
 def _archive_output(user_id: str, job_id: str, local_path: str, scene_name: str = "") -> str:

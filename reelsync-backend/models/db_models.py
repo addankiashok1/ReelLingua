@@ -125,6 +125,7 @@ class Project(Base):
     __tablename__ = "projects"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, nullable=False)
+    trashed_at = Column(DateTime(timezone=True), nullable=True, index=True)
     user_id = Column(
         UUID(as_uuid=True),
         ForeignKey("users.id", ondelete="CASCADE"),
@@ -169,6 +170,7 @@ class RenderJob(Base):
     __tablename__ = "render_jobs"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, nullable=False)
+    trashed_at = Column(DateTime(timezone=True), nullable=True, index=True)
     project_id = Column(
         UUID(as_uuid=True),
         ForeignKey("projects.id", ondelete="CASCADE"),
@@ -183,6 +185,7 @@ class RenderJob(Base):
     progress_percentage = Column(Integer, nullable=False, default=0, server_default="0")
     input_video_path = Column(String, nullable=True)   # per-scene source; falls back to project.original_video_path
     output_video_path = Column(String, nullable=True)
+    thumbnail_path = Column(String, nullable=True)      # extracted JPEG frame; served via /thumbnails static mount
     error_message = Column(String, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(
@@ -202,6 +205,34 @@ class RenderJob(Base):
 
     project = relationship("Project", back_populates="render_jobs")
     explorer_folder = relationship("ExplorerFolder", back_populates="scenes", foreign_keys=[folder_id])
+    edit_history = relationship(
+        "SceneEditHistory",
+        back_populates="scene",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        order_by="SceneEditHistory.created_at.desc()",
+    )
+
+
+class SceneEditHistory(Base):
+    """Snapshot of language settings saved each time a scene is re-queued."""
+    __tablename__ = "scene_edit_history"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, nullable=False)
+    scene_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("render_jobs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    target_voice_lang = Column(String(10), nullable=False)
+    target_subtitle_lang = Column(String(10), nullable=True)
+    source_language = Column(String(10), nullable=True)
+    output_video_path = Column(String, nullable=True)   # preserved old render file
+    thumbnail_path = Column(String, nullable=True)      # preserved old thumbnail
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    scene = relationship("RenderJob", back_populates="edit_history")
 
 
 class ExplorerFolder(Base):
@@ -213,6 +244,7 @@ class ExplorerFolder(Base):
     __tablename__ = "explorer_folders"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, nullable=False)
+    trashed_at = Column(DateTime(timezone=True), nullable=True, index=True)
     project_id = Column(
         UUID(as_uuid=True),
         ForeignKey("projects.id", ondelete="CASCADE"),

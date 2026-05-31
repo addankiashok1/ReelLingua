@@ -530,7 +530,10 @@ class SceneItem(BaseModel):
     source_language: Optional[str] = None
     status: str
     progress_percentage: int = 0
+    input_video_path: Optional[str] = None  # filesystem path of the original upload
     output_video_path: Optional[str] = None
+    thumbnail_path: Optional[str] = None    # filesystem path; used server-side for cleanup
+    thumbnail_url: Optional[str] = None     # relative URL served by /thumbnails static mount
     error_message: Optional[str] = None
     created_at: str
     updated_at: str
@@ -544,6 +547,27 @@ class ProjectDetailResponse(BaseModel):
     target_subtitle_lang: Optional[str] = None
     created_at: str
     scenes: list[SceneItem]
+
+
+# ─── Trash ────────────────────────────────────────────────────────────────────
+
+class TrashItemResponse(BaseModel):
+    id: str
+    kind: str               # "project" | "scene"
+    name: str
+    trashed_at: str         # ISO datetime string
+    expires_at: str         # trashed_at + 15 days, ISO string
+    days_remaining: int
+    parent_name: Optional[str] = None  # project title for scenes
+
+
+class TrashSummaryResponse(BaseModel):
+    items: list[TrashItemResponse]
+    count: int
+
+
+class TrashCountResponse(BaseModel):
+    count: int
 
 
 # ─── Explorer: recursive folder + scene system ────────────────────────────────
@@ -600,3 +624,53 @@ class SceneRename(BaseModel):
         if not v:
             raise ValueError("Scene name cannot be empty.")
         return v
+
+
+class FolderMoveBody(BaseModel):
+    target_folder_id: Optional[str] = None  # None = move to project root
+
+
+class SceneMoveBody(BaseModel):
+    target_folder_id: Optional[str] = None  # None = move to project root
+
+
+class SceneReprocessBody(BaseModel):
+    target_voice_lang: str
+    target_subtitle_lang: Optional[str] = None
+    source_language: str = "auto"
+
+    @field_validator("target_voice_lang")
+    @classmethod
+    def validate_voice(cls, v: str) -> str:
+        return _validate_lang_code(v)
+
+    @field_validator("target_subtitle_lang", mode="before")
+    @classmethod
+    def validate_subtitle(cls, v: Optional[str]) -> Optional[str]:
+        if v is None or v.strip() == "":
+            return None
+        return _validate_subtitle_lang_code(v)
+
+    @field_validator("source_language")
+    @classmethod
+    def validate_source(cls, v: str) -> str:
+        v = v.strip().lower()
+        if v == "auto":
+            return v
+        # Resolve full name → code (e.g. "hindi" → "hi")
+        if v in _LANG_NAME_TO_CODE:
+            v = _LANG_NAME_TO_CODE[v]
+        # Source language must be in ElevenLabs' supported set, not just Google Translate's
+        if v not in _SUPPORTED_CODES:
+            return "auto"  # silently fall back rather than rejecting
+        return v
+
+
+class SceneHistoryItem(BaseModel):
+    id: str
+    target_voice_lang: str
+    target_subtitle_lang: Optional[str] = None
+    source_language: Optional[str] = None
+    output_video_path: Optional[str] = None
+    thumbnail_path: Optional[str] = None
+    created_at: str

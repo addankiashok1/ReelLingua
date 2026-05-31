@@ -57,6 +57,7 @@ settings = Settings()
 ELEVENLABS_API_KEY: str = settings.elevenlabs_api_key
 TEMP_DIR: str = os.path.join(os.path.dirname(__file__), "temp_outputs")
 STORAGE_DIR: str = os.path.join(os.path.dirname(__file__), "local_storage")
+THUMBNAILS_DIR: str = os.path.join(STORAGE_DIR, "thumbnails")
 
 # Maximum number of render jobs that may execute concurrently.
 # Each job ties up one ElevenLabs API call + one MoviePy thread, so keep this

@@ -13,9 +13,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 import config
 from config import settings
 from database import engine, get_db
-from models.db_models import Base, ExplorerFolder, Folder, OTPVerification, PasswordResetOTP, PaymentTransaction, User  # noqa: F401 — registers models with Base
+from models.db_models import Base, ExplorerFolder, Folder, OTPVerification, PasswordResetOTP, PaymentTransaction, SceneEditHistory, User  # noqa: F401 — registers models with Base
 from routers import auth, payments, user, videos
-from routers import explorer, projects
+from routers import explorer, projects, trash
 from routers.auth import ALGORITHM
 
 logging.basicConfig(
@@ -28,6 +28,7 @@ os.makedirs(config.TEMP_DIR, exist_ok=True)
 os.makedirs(os.path.join(config.STORAGE_DIR, "inputs"), exist_ok=True)
 os.makedirs(os.path.join(config.STORAGE_DIR, "outputs"), exist_ok=True)
 os.makedirs(os.path.join(config.STORAGE_DIR, "profiles"), exist_ok=True)
+os.makedirs(config.THUMBNAILS_DIR, exist_ok=True)
 
 app = FastAPI(
     title="ReelSync AI",
@@ -46,7 +47,7 @@ app.add_middleware(
         "http://127.0.0.1:3000",
     ],
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -56,11 +57,18 @@ app.include_router(payments.router, prefix="/api/payments", tags=["Payments"])
 app.include_router(user.router,     prefix="/api/user",     tags=["User"])
 app.include_router(projects.router, prefix="/api",          tags=["Projects & Folders"])
 app.include_router(explorer.router, prefix="/api",          tags=["Explorer"])
+app.include_router(trash.router,    prefix="/api",          tags=["Trash"])
 
 app.mount(
     "/profiles",
     StaticFiles(directory=os.path.join(config.STORAGE_DIR, "profiles")),
     name="profiles",
+)
+
+app.mount(
+    "/thumbnails",
+    StaticFiles(directory=config.THUMBNAILS_DIR),
+    name="thumbnails",
 )
 
 
@@ -121,6 +129,70 @@ async def download_video(
         )
 
     logger.info(f"[download] user={user.id} file={filename}")
+    return FileResponse(
+        file_path,
+        media_type="video/mp4",
+        filename=filename,
+    )
+
+
+# ─── Authenticated original-video stream ──────────────────────────────────────
+# Mirrors /downloads/ but serves from local_storage/inputs/{user_id}/.
+# The QC Comparison modal requests this endpoint so users can preview the
+# original upload alongside the dubbed output without exposing every file
+# via an open StaticFiles mount.
+
+@app.get("/originals/{filename}", tags=["Downloads"])
+async def stream_original_video(
+    filename: str,
+    token: str = Query(..., description="JWT access token"),
+    db: AsyncSession = Depends(get_db),
+):
+    # ── Validate JWT ─────────────────────────────────────────────────────────
+    try:
+        payload = jwt.decode(token, settings.jwt_secret_key, algorithms=[ALGORITHM])
+        user_id_str: str = payload.get("sub", "")
+        if not user_id_str:
+            raise JWTError("Missing subject")
+    except JWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired token.",
+        )
+
+    # ── Resolve user ──────────────────────────────────────────────────────────
+    try:
+        user_uuid = uuid.UUID(user_id_str)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Malformed token subject.",
+        )
+
+    original_user: User | None = await db.get(User, user_uuid)
+    if not original_user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User no longer exists.",
+        )
+
+    # ── Path-traversal guard ──────────────────────────────────────────────────
+    if os.sep in filename or "/" in filename or "\\" in filename:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid filename.",
+        )
+
+    # ── Serve only from the requesting user's own inputs directory ────────────
+    file_path = os.path.join(config.STORAGE_DIR, "inputs", str(original_user.id), filename)
+
+    if not os.path.isfile(file_path):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Original file not found.",
+        )
+
+    logger.info(f"[originals] user={original_user.id} file={filename}")
     return FileResponse(
         file_path,
         media_type="video/mp4",
@@ -223,8 +295,58 @@ async def create_tables() -> None:
             "folder_id UUID REFERENCES explorer_folders(id) ON DELETE CASCADE"
         ))
         await conn.execute(text(
+            "ALTER TABLE render_jobs ADD COLUMN IF NOT EXISTS thumbnail_path VARCHAR"
+        ))
+        await conn.execute(text(
             "CREATE INDEX IF NOT EXISTS ix_render_jobs_folder_id "
             "ON render_jobs(folder_id)"
+        ))
+        # ── Scene edit history ─────────────────────────────────────────────────
+        await conn.execute(text(
+            """
+            CREATE TABLE IF NOT EXISTS scene_edit_history (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                scene_id UUID NOT NULL REFERENCES render_jobs(id) ON DELETE CASCADE,
+                target_voice_lang VARCHAR(10) NOT NULL,
+                target_subtitle_lang VARCHAR(10),
+                source_language VARCHAR(10),
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """
+        ))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_scene_edit_history_scene_id "
+            "ON scene_edit_history(scene_id)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE scene_edit_history ADD COLUMN IF NOT EXISTS output_video_path VARCHAR"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE scene_edit_history ADD COLUMN IF NOT EXISTS thumbnail_path VARCHAR"
+        ))
+        # ── Trash system ──────────────────────────────────────────────────────
+        await conn.execute(text(
+            "ALTER TABLE projects ADD COLUMN IF NOT EXISTS trashed_at TIMESTAMPTZ"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE render_jobs ADD COLUMN IF NOT EXISTS trashed_at TIMESTAMPTZ"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE explorer_folders ADD COLUMN IF NOT EXISTS trashed_at TIMESTAMPTZ"
+        ))
+        # Partial indexes — only index rows that are actually in the trash to
+        # keep the index small and the cleanup query fast.
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_projects_trashed_at "
+            "ON projects(trashed_at) WHERE trashed_at IS NOT NULL"
+        ))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_render_jobs_trashed_at "
+            "ON render_jobs(trashed_at) WHERE trashed_at IS NOT NULL"
+        ))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_explorer_folders_trashed_at "
+            "ON explorer_folders(trashed_at) WHERE trashed_at IS NOT NULL"
         ))
     logging.getLogger(__name__).info("Database tables and columns verified.")
 

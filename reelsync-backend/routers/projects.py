@@ -102,7 +102,8 @@ async def list_projects(
     result = await db.execute(
         select(Project)
         .where(Project.user_id == current_user.id)
-        .where(Project.is_workspace == True)  # noqa: E712
+        .where(Project.is_workspace == True)   # noqa: E712
+        .where(Project.trashed_at.is_(None))   # exclude trashed projects
         .order_by(Project.created_at.desc())
     )
     return [_project_response(p) for p in result.scalars().all()]
