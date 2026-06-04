@@ -184,6 +184,8 @@ class RenderJob(Base):
     status = Column(String(30), nullable=False, default="PENDING")
     progress_percentage = Column(Integer, nullable=False, default=0, server_default="0")
     input_video_path = Column(String, nullable=True)   # per-scene source; falls back to project.original_video_path
+    original_height = Column(Integer, nullable=True)   # native vertical resolution extracted by ffprobe on upload
+    output_height = Column(Integer, nullable=True)     # user-selected output resolution (0 or NULL = match original)
     output_video_path = Column(String, nullable=True)
     thumbnail_path = Column(String, nullable=True)      # extracted JPEG frame; served via /thumbnails static mount
     error_message = Column(String, nullable=True)

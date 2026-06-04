@@ -297,6 +297,13 @@ async def create_tables() -> None:
         await conn.execute(text(
             "ALTER TABLE render_jobs ADD COLUMN IF NOT EXISTS thumbnail_path VARCHAR"
         ))
+        # ── Video resolution metadata ──────────────────────────────────────────
+        await conn.execute(text(
+            "ALTER TABLE render_jobs ADD COLUMN IF NOT EXISTS original_height INTEGER"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE render_jobs ADD COLUMN IF NOT EXISTS output_height INTEGER"
+        ))
         await conn.execute(text(
             "CREATE INDEX IF NOT EXISTS ix_render_jobs_folder_id "
             "ON render_jobs(folder_id)"

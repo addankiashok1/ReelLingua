@@ -530,7 +530,9 @@ class SceneItem(BaseModel):
     source_language: Optional[str] = None
     status: str
     progress_percentage: int = 0
-    input_video_path: Optional[str] = None  # filesystem path of the original upload
+    input_video_path: Optional[str] = None   # filesystem path of the original upload
+    original_height: Optional[int] = None    # native vertical resolution (px), set on upload
+    output_height: Optional[int] = None      # user-selected output resolution (0/None = match original)
     output_video_path: Optional[str] = None
     thumbnail_path: Optional[str] = None    # filesystem path; used server-side for cleanup
     thumbnail_url: Optional[str] = None     # relative URL served by /thumbnails static mount
@@ -638,6 +640,7 @@ class SceneReprocessBody(BaseModel):
     target_voice_lang: str
     target_subtitle_lang: Optional[str] = None
     source_language: str = "auto"
+    output_height: Optional[int] = None   # desired output resolution; None = keep current setting
 
     @field_validator("target_voice_lang")
     @classmethod

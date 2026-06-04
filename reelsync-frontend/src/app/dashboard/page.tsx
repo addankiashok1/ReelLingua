@@ -636,7 +636,7 @@ export default function DashboardPage() {
   }, [])
 
   const handleLaunchStudio = async () => {
-    if (!selectedFile || uploadPhase === 'uploading') return
+    if (!selectedFile || uploadPhase === 'uploading' || uploadPhase === 'queued') return
 
     setUploadPhase('uploading')
     setUploadProgress(0)
@@ -780,6 +780,17 @@ export default function DashboardPage() {
   const isActive    = credits > 0
   const isUploading = uploadPhase === 'uploading'
   const canSubmit   = !!selectedFile && (isFree || credits > 0) && !isUploading && uploadPhase !== 'queued'
+  const submitButtonLabel = uploadPhase === 'error'
+    ? 'Retry upload'
+    : isUploading
+      ? 'Uploading video'
+      : uploadPhase === 'queued'
+        ? 'Job queued'
+        : !selectedFile && credits > 0
+          ? 'Click to Render Video'
+          : credits <= 0 && !isFree
+            ? 'Top up credits first'
+            : 'Launch studio'
 
   return (
     <>
@@ -1440,63 +1451,61 @@ export default function DashboardPage() {
 
             {/* Launch button */}
             <button
+              type="button"
               onClick={handleLaunchStudio}
-              disabled={!canSubmit}
-              className="mt-auto w-full flex items-center justify-center gap-2.5 py-3.5 rounded-xl text-sm font-semibold transition-all duration-200 disabled:cursor-not-allowed"
-              style={canSubmit ? {
-                background:  'linear-gradient(135deg, #4f46e5, #7c3aed)',
-                boxShadow:   '0 4px 20px rgba(99,102,241,0.35)',
-                color:       '#ffffff',
-              } : {
-                background:  '#1e293b',
-                color:       '#475569',
-              }}
+              disabled={isUploading || !selectedFile}
+              aria-label={submitButtonLabel}
+              title={submitButtonLabel}
+              className={`mt-auto w-full h-12 flex items-center justify-center rounded-xl font-semibold text-sm transition-all duration-200 gap-2.5 ${
+                (selectedFile && !isUploading)
+                  ? 'bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-700 hover:to-purple-700 text-white shadow-lg cursor-pointer opacity-100'
+                  : 'bg-slate-800 text-slate-400 cursor-not-allowed opacity-60'
+              }`}
             >
-              {/* No file yet */}
-              {!selectedFile && credits > 0 && (
-                <>
-                  <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
-                  </svg>
-                  Select a Video First
-                </>
-              )}
-              {/* No credits (not shown for free plan in testing mode) */}
-              {credits <= 0 && !isFree && (
-                <>
-                  <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
-                  </svg>
-                  Top Up Credits First
-                </>
-              )}
-              {/* Uploading */}
-              {isUploading && (
+              {isUploading ? (
                 <>
                   <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24">
                     <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
                     <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
                   </svg>
-                  Uploading…
+                  <span className="text-white block">Uploading…</span>
                 </>
-              )}
-              {/* Ready to launch */}
-              {selectedFile && credits > 0 && !isUploading && uploadPhase === 'idle' && (
+              ) : uploadPhase === 'queued' ? (
                 <>
-                  <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" />
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                  <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="white" strokeWidth={2}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M12 8v4l2 2" />
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M20 12a8 8 0 11-16 0 8 8 0 0116 0z" />
                   </svg>
-                  Launch Studio
+                  <span className="text-white block">Job queued</span>
                 </>
-              )}
-              {/* Error state */}
-              {uploadPhase === 'error' && (
+              ) : uploadPhase === 'error' ? (
                 <>
                   <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                     <path strokeLinecap="round" strokeLinejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
                   </svg>
-                  Retry Upload
+                  <span className="text-white block">Retry Upload</span>
+                </>
+              ) : selectedFile && credits > 0 ? (
+                <>
+                  <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="white" strokeWidth={2}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" />
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                  </svg>
+                  <span className="text-white block">Launch studio</span>
+                </>
+              ) : credits <= 0 && !isFree ? (
+                <>
+                  <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+                  </svg>
+                  <span className="block">Top Up Credits First</span>
+                </>
+              ) : (
+                <>
+                  <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
+                  </svg>
+                  <span className="text-white block">Click to Render Video</span>
                 </>
               )}
             </button>

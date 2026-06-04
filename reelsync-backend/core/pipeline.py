@@ -73,6 +73,7 @@ async def run_background_job(
     subtitle_lang: str = "en",
     source_lang: str = "auto",
     scene_name: str = "",
+    output_height: int = 0,
 ) -> None:
     """
     Full render pipeline for one job. Runs as an async FastAPI background task.
@@ -354,6 +355,7 @@ async def run_background_job(
                 target_lang,
                 actual_sub_lang,
                 apply_watermark,
+                output_height,
             )
 
             # ── Milestone 6: RENDERING_IN_PROGRESS (95%) — burn done, archiving
@@ -453,6 +455,7 @@ def _burn_video(
     target_lang: str,
     subtitle_lang: str = "",
     watermark: bool = False,
+    output_height: int = 0,
 ) -> str:
     """Thin wrapper so asyncio.to_thread can call burn_assets positionally."""
     return engine.burn_assets(
@@ -462,6 +465,7 @@ def _burn_video(
         output_path=output_path,
         target_lang=subtitle_lang or target_lang,
         watermark=watermark,
+        output_height=output_height,
     )
 
 

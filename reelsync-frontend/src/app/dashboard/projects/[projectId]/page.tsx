@@ -69,6 +69,38 @@ interface FolderItem {
   created_at: string
 }
 
+// ─── Quality presets ─────────────────────────────────────────────────────────
+
+const QUALITY_PRESETS = [
+  { label: '360p',          height: 360  },
+  { label: '480p',          height: 480  },
+  { label: '720p (HD)',     height: 720  },
+  { label: '1080p (FHD)',   height: 1080 },
+  { label: '1440p (2K)',    height: 1440 },
+  { label: '2160p (4K)',    height: 2160 },
+] as const
+
+/** Returns presets available for a given native height (never allows upscaling). */
+function availablePresets(nativeHeight: number | null) {
+  if (!nativeHeight) return QUALITY_PRESETS
+  return QUALITY_PRESETS.filter(p => p.height <= nativeHeight)
+}
+
+/** Best-effort browser-side resolution detection before upload. */
+function detectVideoHeight(file: File): Promise<number | null> {
+  return new Promise(resolve => {
+    const video = document.createElement('video')
+    video.preload = 'metadata'
+    video.onloadedmetadata = () => {
+      const h = video.videoHeight
+      URL.revokeObjectURL(video.src)
+      resolve(h > 0 ? h : null)
+    }
+    video.onerror = () => { URL.revokeObjectURL(video.src); resolve(null) }
+    video.src = URL.createObjectURL(file)
+  })
+}
+
 interface SceneItem {
   job_id: string
   project_id: string
@@ -80,6 +112,8 @@ interface SceneItem {
   status: string
   progress_percentage: number
   input_video_path: string | null
+  original_height: number | null
+  output_height: number | null
   output_video_path: string | null
   thumbnail_path: string | null
   thumbnail_url: string | null
@@ -643,21 +677,29 @@ function AddSceneModal({
   onClose: () => void
   onQueued: (scene: SceneItem) => void
 }) {
-  const [file, setFile] = useState<File | null>(null)
-  const [sceneName, setSceneName] = useState('')
-  const [voiceLang, setVoiceLang] = useState('hi')
-  const [subtitleLang, setSubtitleLang] = useState('en')
-  const [sourceLang, setSourceLang] = useState('auto')
-  const [uploading, setUploading] = useState(false)
-  const [error, setError] = useState('')
+  const [file,           setFile]           = useState<File | null>(null)
+  const [sceneName,      setSceneName]      = useState('')
+  const [voiceLang,      setVoiceLang]      = useState('hi')
+  const [subtitleLang,   setSubtitleLang]   = useState('en')
+  const [sourceLang,     setSourceLang]     = useState('auto')
+  const [outputHeight,   setOutputHeight]   = useState<number>(0)   // 0 = match source
+  const [nativeHeight,   setNativeHeight]   = useState<number | null>(null)
+  const [uploading,      setUploading]      = useState(false)
+  const [error,          setError]          = useState('')
   const fileRef = useRef<HTMLInputElement>(null)
 
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleFileChange = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0]
     if (!f) return
     setFile(f)
     if (!sceneName) setSceneName(f.name.replace(/\.[^.]+$/, ''))
-  }
+    // Detect native resolution in-browser and reset quality to "Match Source"
+    const h = await detectVideoHeight(f)
+    setNativeHeight(h)
+    setOutputHeight(0)
+  }, [sceneName])
+
+  const presets = availablePresets(nativeHeight)
 
   const handleSubmit = useCallback(async (e: React.FormEvent) => {
     e.preventDefault()
@@ -671,6 +713,7 @@ function AddSceneModal({
     fd.append('target_language', voiceLang)
     fd.append('subtitle_language', subtitleLang)
     fd.append('source_language', sourceLang)
+    fd.append('output_height', String(outputHeight))
     if (sceneName.trim()) fd.append('scene_name', sceneName.trim())
 
     try {
@@ -688,6 +731,8 @@ function AddSceneModal({
         status: 'PENDING',
         progress_percentage: 0,
         input_video_path: null,
+        original_height: nativeHeight,
+        output_height: outputHeight || null,
         output_video_path: null,
         thumbnail_path: null,
         thumbnail_url: null,
@@ -700,7 +745,7 @@ function AddSceneModal({
       setError(err.response?.data?.detail ?? 'Upload failed. Please try again.')
       setUploading(false)
     }
-  }, [file, sceneName, voiceLang, subtitleLang, sourceLang, projectId, currentFolderId, onQueued, onClose])
+  }, [file, sceneName, voiceLang, subtitleLang, sourceLang, outputHeight, nativeHeight, projectId, currentFolderId, onQueued, onClose])
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm px-4">
@@ -789,6 +834,45 @@ function AddSceneModal({
             </div>
           </div>
 
+          {/* Output quality selector */}
+          <div>
+            <label className="block text-xs font-medium text-slate-400 mb-1.5">
+              Output Quality
+              {nativeHeight && (
+                <span className="ml-1.5 text-slate-600 font-normal">
+                  — source is {nativeHeight}p; options above it are hidden
+                </span>
+              )}
+            </label>
+            <div className="flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={() => setOutputHeight(0)}
+                className={`px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors ${
+                  outputHeight === 0
+                    ? 'bg-indigo-600 border-indigo-500 text-white'
+                    : 'bg-slate-800 border-slate-700 text-slate-400 hover:text-white hover:border-slate-600'
+                }`}
+              >
+                Match Source
+              </button>
+              {presets.map(p => (
+                <button
+                  key={p.height}
+                  type="button"
+                  onClick={() => setOutputHeight(p.height)}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors ${
+                    outputHeight === p.height
+                      ? 'bg-indigo-600 border-indigo-500 text-white'
+                      : 'bg-slate-800 border-slate-700 text-slate-400 hover:text-white hover:border-slate-600'
+                  }`}
+                >
+                  {p.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
           {error && <p className="text-xs text-red-400">{error}</p>}
 
           <div className="flex gap-3 pt-1">
@@ -826,17 +910,24 @@ function EditSceneModal({
   const [sourceLang,   setSourceLang]   = useState(
     supportedVoiceCodes.has(scene.source_language ?? '') ? (scene.source_language ?? 'auto') : 'auto'
   )
+  // Initialise to the current job's output_height (0 = match source)
+  const [outputHeight, setOutputHeight] = useState<number>(scene.output_height ?? 0)
   const [saving, setSaving] = useState(false)
   const [error,  setError]  = useState('')
+
+  // Presets capped to the original resolution — uses the server-derived value
+  // so it is always accurate (not the browser estimate used during upload).
+  const editPresets = availablePresets(scene.original_height ?? null)
 
   const handleSubmit = useCallback(async (e: React.FormEvent) => {
     e.preventDefault()
     setSaving(true); setError('')
     try {
       const res = await api.post<SceneItem>(`/api/scenes/${scene.job_id}/reprocess`, {
-        target_voice_lang: voiceLang,
+        target_voice_lang:    voiceLang,
         target_subtitle_lang: subtitleLang,
-        source_language: sourceLang,
+        source_language:      sourceLang,
+        output_height:        outputHeight || null,
       })
       onReprocessed(res.data)
       onClose()
@@ -844,11 +935,12 @@ function EditSceneModal({
       setError(err.response?.data?.detail ?? 'Something went wrong.')
       setSaving(false)
     }
-  }, [voiceLang, subtitleLang, sourceLang, scene.job_id, onReprocessed, onClose])
+  }, [voiceLang, subtitleLang, sourceLang, outputHeight, scene.job_id, onReprocessed, onClose])
 
-  const changed = voiceLang !== scene.target_voice_lang
+  const changed = voiceLang    !== scene.target_voice_lang
     || subtitleLang !== (scene.target_subtitle_lang ?? 'en')
     || sourceLang   !== (scene.source_language ?? 'auto')
+    || outputHeight !== (scene.output_height ?? 0)
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm px-4">
@@ -905,6 +997,45 @@ function EditSceneModal({
               >
                 {SUBTITLE_LANGUAGES.map(l => <option key={l.code} value={l.code}>{l.label}</option>)}
               </select>
+            </div>
+          </div>
+
+          {/* Output quality — options are hard-capped at the original resolution */}
+          <div>
+            <label className="block text-xs font-medium text-slate-400 mb-1.5">
+              Output Quality
+              {scene.original_height && (
+                <span className="ml-1.5 text-slate-600 font-normal">
+                  — source is {scene.original_height}p
+                </span>
+              )}
+            </label>
+            <div className="flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={() => setOutputHeight(0)}
+                className={`px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors ${
+                  outputHeight === 0
+                    ? 'bg-indigo-600 border-indigo-500 text-white'
+                    : 'bg-slate-800 border-slate-700 text-slate-400 hover:text-white hover:border-slate-600'
+                }`}
+              >
+                Match Source
+              </button>
+              {editPresets.map(p => (
+                <button
+                  key={p.height}
+                  type="button"
+                  onClick={() => setOutputHeight(p.height)}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors ${
+                    outputHeight === p.height
+                      ? 'bg-indigo-600 border-indigo-500 text-white'
+                      : 'bg-slate-800 border-slate-700 text-slate-400 hover:text-white hover:border-slate-600'
+                  }`}
+                >
+                  {p.label}
+                </button>
+              ))}
             </div>
           </div>
 

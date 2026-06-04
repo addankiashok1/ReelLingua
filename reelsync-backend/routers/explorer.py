@@ -12,8 +12,10 @@ Recursive file-explorer endpoints for the Projects workspace.
   DELETE /api/scenes/{scene_id}                            Delete scene + file cleanup
 """
 
+import json
 import logging
 import os
+import subprocess
 import uuid
 from typing import List, Optional
 
@@ -55,6 +57,40 @@ router = APIRouter()
 
 ALLOWED_MIME_TYPES = {"video/mp4", "video/quicktime", "video/x-matroska", "video/avi"}
 INPUT_DIR = os.path.join(STORAGE_DIR, "inputs")
+
+# Supported output resolution presets (height in pixels).
+# The selected output_height must not exceed the video's original_height.
+RESOLUTION_PRESETS: frozenset[int] = frozenset({360, 480, 720, 1080, 1440, 2160})
+
+
+def get_video_height(file_path: str) -> int:
+    """
+    Extract the native vertical resolution (height) of a video file using ffprobe.
+
+    Returns the height in pixels, or 720 as a safe fallback if ffprobe is
+    unavailable or the stream metadata cannot be parsed.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=height",
+                "-of", "json",
+                file_path,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=15,
+        )
+        data = json.loads(result.stdout)
+        height: int = data["streams"][0]["height"]
+        logger.info(f"[explorer] ffprobe detected height={height}px for {os.path.basename(file_path)}")
+        return height
+    except Exception as exc:
+        logger.warning(f"[explorer] ffprobe height extraction failed ({exc}) — defaulting to 720px")
+        return 720
 
 
 # ─── Internal helpers ─────────────────────────────────────────────────────────
@@ -117,6 +153,8 @@ def _scene_item(j: RenderJob) -> SceneItem:
         status=j.status,
         progress_percentage=j.progress_percentage,
         input_video_path=j.input_video_path,
+        original_height=j.original_height,
+        output_height=j.output_height,
         output_video_path=j.output_video_path,
         thumbnail_path=j.thumbnail_path,
         thumbnail_url=thumbnail_url,
@@ -318,6 +356,7 @@ async def create_scene(
     target_language: str = Form(...),
     source_language: str = Form("auto"),
     subtitle_language: str = Form("en"),
+    output_height: int = Form(0, description="Desired output resolution height in px; 0 = match source"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -368,6 +407,15 @@ async def create_scene(
 
     logger.info(f"[explorer] saved {len(contents):,} bytes → {local_path}")
 
+    # ── Extract native resolution via ffprobe ─────────────────────────────────
+    native_height: int = get_video_height(local_path)
+
+    # Cap the requested output_height to the native resolution.
+    # If output_height is 0 or exceeds the native height, match the source.
+    safe_output_height: Optional[int] = None
+    if output_height and 0 < output_height < native_height:
+        safe_output_height = output_height
+
     # ── Create RenderJob ──────────────────────────────────────────────────────
     clean_name = (scene_name or "").strip() or None
     job = RenderJob(
@@ -379,6 +427,8 @@ async def create_scene(
         subtitle_language=subtitle_language,
         source_language=source_language,
         input_video_path=local_path,
+        original_height=native_height,
+        output_height=safe_output_height,
         status="PENDING",
     )
     db.add(job)
@@ -400,6 +450,7 @@ async def create_scene(
         subtitle_lang=subtitle_language,
         source_lang=source_language,
         scene_name=clean_name or "",
+        output_height=safe_output_height or 0,
     )
 
     return ProcessResponse(
@@ -625,10 +676,19 @@ async def reprocess_scene(
     )
     db.add(history_entry)
 
-    # Update job with new language settings and reset pipeline state
+    # Cap output_height to the original resolution so it is never upscaled
+    if body.output_height and job.original_height:
+        reprocess_output_height = min(body.output_height, job.original_height)
+    elif body.output_height:
+        reprocess_output_height = body.output_height
+    else:
+        reprocess_output_height = job.output_height or 0
+
+    # Update job with new language settings, resolution, and reset pipeline state
     job.target_language = body.target_voice_lang
     job.subtitle_language = body.target_subtitle_lang
     job.source_language = body.source_language
+    job.output_height = reprocess_output_height if reprocess_output_height else None
     job.status = "PENDING"
     job.progress_percentage = 0
     job.output_video_path = None
@@ -648,6 +708,7 @@ async def reprocess_scene(
         subtitle_lang=body.target_subtitle_lang or "en",
         source_lang=body.source_language,
         scene_name=job.scene_name or "",
+        output_height=reprocess_output_height,
     )
 
     logger.info(

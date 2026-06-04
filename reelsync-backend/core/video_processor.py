@@ -239,9 +239,33 @@ class VideoEngine:
         output_path: str,
         target_lang: str = "",
         watermark: bool = False,
+        output_height: int = 0,
     ) -> str:
         logger.info(f"Loading video: {original_video_path}")
         video = VideoFileClip(original_video_path)
+
+        # Build the FFmpeg scale filter string for the encoding pass.
+        # We intentionally do NOT resize the MoviePy clip here so that
+        # subtitle text and watermarks composite at the source resolution
+        # (sharpest possible glyphs).  The scale filter runs inside FFmpeg's
+        # encoding pipeline — one decode→composite→encode pass, no double
+        # transcoding.
+        #
+        # scale=-2:{h}  →  height is the user's requested value;
+        #                   width is auto-calculated to preserve aspect ratio
+        #                   and be divisible by 2 (H.264 requirement).
+        #
+        # A target height that is 0, None, or ≥ the source height means
+        # "match source" — we skip the filter entirely so FFmpeg never upscales.
+        native_h = video.h
+        if output_height and 0 < output_height < native_h:
+            _scale_filter = ["-vf", f"scale=-2:{output_height}"]
+            logger.info(
+                f"[video_processor] FFmpeg scale filter will downscale "
+                f"{native_h}px → {output_height}px at encode time"
+            )
+        else:
+            _scale_filter = []
 
         logger.info(f"Loading dubbed audio: {dubbed_audio_path}")
         audio = AudioFileClip(dubbed_audio_path)
