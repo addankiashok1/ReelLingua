@@ -512,7 +512,7 @@ export default function SyncPage() {
                 </div>
                 <div>
                   <h3 className="text-sm font-semibold text-gray-800">Original Video Language</h3>
-                  <p className="text-[11px] text-gray-400">Language spoken in your source video — leave Auto for ElevenLabs to detect</p>
+                  <p className="text-[11px] text-gray-400">Language spoken in your source video — leave Auto for automatic detection</p>
                 </div>
               </div>
               <select
@@ -662,7 +662,7 @@ export default function SyncPage() {
             { key: 'PENDING',               pct: 3,   label: 'Queued',    desc: 'Waiting in the render queue…'                },
             { key: 'STARTED',               pct: 5,   label: 'Started',   desc: 'Initializing project…'                       },
             { key: 'EXTRACTED_AUDIO',       pct: 20,  label: 'Extracted', desc: 'Extracting original source audio…'            },
-            { key: 'CLONED_AUDIO',          pct: 45,  label: 'Cloned',    desc: 'Cloning speech signatures via ElevenLabs…'    },
+            { key: 'CLONED_AUDIO',          pct: 45,  label: 'Cloned',    desc: 'Cloning speech signatures…'    },
             { key: 'DUBBING_COMPLETED',     pct: 65,  label: 'Dubbed',    desc: 'Audio localization complete…'                 },
             { key: 'APPENDING_TO_VIDEO',    pct: 80,  label: 'Merging',   desc: 'Merging audio tracks & subtitles…'            },
             { key: 'RENDERING_IN_PROGRESS', pct: 95,  label: 'Rendering', desc: 'Finalizing composition render pass…'          },
@@ -683,7 +683,7 @@ export default function SyncPage() {
                 </div>
                 <div>
                   <h2 className="text-lg font-bold text-gray-800">Processing Your Video</h2>
-                  <p className="text-gray-500 text-xs mt-0.5">ElevenLabs AI dubbing — typically 2–5 minutes</p>
+                  <p className="text-gray-500 text-xs mt-0.5">AI dubbing in progress — typically 2–5 minutes</p>
                 </div>
               </div>
 

@@ -114,8 +114,10 @@ class UserOut(BaseModel):
     user_id: str
     email: str
     credit_minutes: int
+    credit_seconds: int = 0
     subscription_plan: str = "free"
     credit_limit_minutes: int = 2
+    credit_limit_seconds: int = 0
     phone_number: Optional[str] = None
     profile_picture_url: Optional[str] = None
 
@@ -604,6 +606,7 @@ class ExplorerFolderItem(BaseModel):
 class ExplorerContentsResponse(BaseModel):
     project_id: str
     project_name: str
+    project_original_video_path: Optional[str] = None
     current_folder_id: Optional[str] = None
     folders: list[ExplorerFolderItem]
     scenes: list[SceneItem]

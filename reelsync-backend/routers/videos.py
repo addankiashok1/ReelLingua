@@ -25,7 +25,6 @@ it already does.
 
 import logging
 import os
-import subprocess
 import uuid
 from typing import List, Optional
 
@@ -42,9 +41,11 @@ from fastapi import (
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from billing import get_generation_block_reason
 from config import PROFITABLE_TIERS, STORAGE_DIR
 from core.pipeline import MAX_CONCURRENT_JOBS, _job_semaphore, run_background_job
 from database import get_db
+from media_probe import probe_video_duration_seconds, probe_video_height
 from models.db_models import Project, RenderJob, User
 from models.schemas import (
     JobStatusResponse,
@@ -64,27 +65,17 @@ OUTPUT_DIR = os.path.join(STORAGE_DIR, "outputs")
 
 
 def get_video_height(file_path: str) -> int:
+    return probe_video_height(file_path)
+
+
+def get_video_duration_seconds(file_path: str) -> int:
     try:
-        result = subprocess.run(
-            [
-                "ffprobe", "-v", "error",
-                "-select_streams", "v:0",
-                "-show_entries", "stream=height",
-                "-of", "json",
-                file_path,
-            ],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        data = __import__("json").loads(result.stdout)
-        height = int(data["streams"][0]["height"])
-        return height
-    except Exception as exc:
-        logger.warning(
-            f"[videos] ffprobe failed to detect height for {file_path}: {exc}"
-        )
-        return 720
+        return probe_video_duration_seconds(file_path)
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
 
 
 # ─── GET /history  (alias: /projects) ────────────────────────────────────────
@@ -349,27 +340,26 @@ async def process_video(
             detail=f"Project '{project_id}' not found or does not belong to you.",
         )
 
-    # ── Pre-flight credit check (bypassed for free plan during testing) ─────────
     plan = (current_user.subscription_plan or "free").lower()
-    if plan != "free" and current_user.credit_minutes < 1:
+    required_seconds = get_video_duration_seconds(project.original_video_path)
+    generation_block_reason = get_generation_block_reason(
+        plan,
+        current_user.seconds_balance,
+        required_seconds,
+    )
+    if generation_block_reason:
         raise HTTPException(
             status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail=(
-                f"Insufficient credits ({current_user.credit_minutes} remaining). "
-                "Top up your account to continue."
-            ),
+            detail=generation_block_reason,
         )
 
     # ── Pre-flight char-balance awareness (informational, not blocking) ───────
-    tier           = PROFITABLE_TIERS.get(plan, PROFITABLE_TIERS["free"])
-    chars_remaining = current_user.chars_balance or 0
-    chars_per_credit = tier["chars_per_credit_minute"]
-
-    if chars_remaining < chars_per_credit * 0.25:
+    remaining_seconds = current_user.seconds_balance or 0
+    if remaining_seconds < required_seconds * 2:
         logger.warning(
-            f"[process] user={current_user.id} chars_remaining={chars_remaining} "
-            f"is below 25% of a single credit limit ({chars_per_credit}). "
-            "Dense-speech content will likely be blocked by the pipeline guard."
+            f"[process] user={current_user.id} seconds_remaining={remaining_seconds} "
+            f"is close to the required render duration ({required_seconds}s). "
+            "The next completed job may exhaust the current cycle."
         )
 
     # ── Language parameters ───────────────────────────────────────────────────
@@ -410,7 +400,7 @@ async def process_video(
         f"[process] new job_id={job.id} project_id={project_id} "
         f"user_id={current_user.id} voice_lang={voice_lang} "
         f"source_lang={source_lang} subtitle_lang={subtitle_lang} plan={plan} "
-        f"chars_remaining={chars_remaining} "
+        f"required_seconds={required_seconds} remaining_seconds={remaining_seconds} "
         f"cross_subtitle={'yes' if voice_lang != subtitle_lang else 'no'}"
     )
 
@@ -535,10 +525,16 @@ async def rework_video(
 
     # ── Credit check ──────────────────────────────────────────────────────────
     plan = (current_user.subscription_plan or "free").lower()
-    if plan != "free" and current_user.credit_minutes < 1:
+    required_seconds = get_video_duration_seconds(original.original_video_path)
+    generation_block_reason = get_generation_block_reason(
+        plan,
+        current_user.seconds_balance,
+        required_seconds,
+    )
+    if generation_block_reason:
         raise HTTPException(
             status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail=f"Insufficient credits ({current_user.credit_minutes} remaining).",
+            detail=generation_block_reason,
         )
 
     # ── Determine new project title ───────────────────────────────────────────
@@ -656,6 +652,7 @@ async def get_credits(current_user: User = Depends(get_current_user)):
     return {
         "user_id": str(current_user.id),
         "credit_minutes": current_user.credit_minutes,
+        "credit_seconds": current_user.seconds_balance or 0,
     }
 
 
@@ -663,43 +660,35 @@ async def get_credits(current_user: User = Depends(get_current_user)):
 
 @router.get(
     "/tier",
-    summary="Return the current user's subscription plan, char balance, and tier limits",
+    summary="Return the current user's subscription plan and second-based tier limits",
 )
 async def get_tier(current_user: User = Depends(get_current_user)):
     """
-    Exposes everything the frontend needs to render the billing/usage section:
-
-    - subscription_plan     — the user's current plan key (e.g. "free", "starter")
-    - tier_label            — human-readable plan name
-    - chars_per_credit      — max transcript chars allowed per 1-credit job on this plan
-    - chars_balance         — the user's remaining character allowance
-    - credit_minutes        — the user's remaining credit minutes
-    - chars_utilization_pct — how much of the character budget has been used
-                              relative to the total that would come with the
-                              current credit_minutes balance
+    Exposes the exact second-based allowance plus derived minute values for UI.
     """
     plan = current_user.subscription_plan or "free"
     tier = PROFITABLE_TIERS.get(plan, PROFITABLE_TIERS["free"])
 
-    chars_per_credit  = tier["chars_per_credit_minute"]
-    chars_balance     = current_user.chars_balance or 0
-    credit_minutes    = current_user.credit_minutes
-    chars_total_grant = chars_per_credit * credit_minutes
+    seconds_balance = current_user.seconds_balance or 0
+    credit_minutes = current_user.credit_minutes
+    seconds_total_grant = max(tier["allowed_seconds"], seconds_balance)
 
     utilization_pct = (
-        round((1 - chars_balance / chars_total_grant) * 100, 1)
-        if chars_total_grant > 0
+        round((1 - seconds_balance / seconds_total_grant) * 100, 1)
+        if seconds_total_grant > 0
         else 100.0
     )
 
     return {
-        "user_id":               str(current_user.id),
-        "subscription_plan":     plan,
-        "tier_label":            tier["label"],
-        "chars_per_credit":      chars_per_credit,
-        "chars_balance":         chars_balance,
-        "credit_minutes":        credit_minutes,
-        "chars_total_grant":     chars_total_grant,
-        "chars_utilization_pct": utilization_pct,
-        "all_tiers":             PROFITABLE_TIERS,
+        "user_id": str(current_user.id),
+        "subscription_plan": plan,
+        "tier_label": tier["label"],
+        "advertised_minutes": tier["advertised_mins"],
+        "allowed_minutes": tier["allowed_minutes"],
+        "allowed_seconds": tier["allowed_seconds"],
+        "credit_minutes": credit_minutes,
+        "seconds_balance": seconds_balance,
+        "seconds_total_grant": seconds_total_grant,
+        "seconds_utilization_pct": utilization_pct,
+        "all_tiers": PROFITABLE_TIERS,
     }

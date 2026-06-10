@@ -11,6 +11,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import config
+from billing import APP_PLAN_TIMERS, LEGACY_BASE_MINUTES
 from config import settings
 from database import engine, get_db
 from models.db_models import Base, ExplorerFolder, Folder, OTPVerification, PasswordResetOTP, PaymentTransaction, SceneEditHistory, User  # noqa: F401 — registers models with Base
@@ -219,6 +220,10 @@ async def create_tables() -> None:
         ))
         await conn.execute(text(
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS "
+            "seconds_balance INTEGER NOT NULL DEFAULT 0"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS "
             "chars_balance INTEGER NOT NULL DEFAULT 0"
         ))
         await conn.execute(text(
@@ -233,13 +238,33 @@ async def create_tables() -> None:
             "ALTER TABLE render_jobs "
             "ALTER COLUMN status TYPE VARCHAR(30)"
         ))
-        # One-time backfill: users created before the chars_balance column was
-        # added received DEFAULT 0.  Restore their budget based on remaining
-        # credit_minutes so the character-density guard doesn't block them.
+        # One-time backfill: convert legacy minute balances into exact
+        # second-level balances while preserving any purchased top-up delta
+        # above the old base allocation for each plan.
+        free_allowed = APP_PLAN_TIMERS["FREE"]["allowed_seconds"]
+        starter_allowed = APP_PLAN_TIMERS["STARTER"]["allowed_seconds"]
+        creator_allowed = APP_PLAN_TIMERS["CREATOR"]["allowed_seconds"]
+        pro_allowed = APP_PLAN_TIMERS["PRO"]["allowed_seconds"]
+        free_legacy = LEGACY_BASE_MINUTES["FREE"]
+        starter_legacy = LEGACY_BASE_MINUTES["STARTER"]
+        creator_legacy = LEGACY_BASE_MINUTES["CREATOR"]
+        pro_legacy = LEGACY_BASE_MINUTES["PRO"]
         await conn.execute(text(
             "UPDATE users "
-            "SET chars_balance = credit_minutes * 750 "
-            "WHERE chars_balance = 0 AND credit_minutes > 0"
+            "SET seconds_balance = CASE lower(subscription_plan) "
+            f"WHEN 'starter' THEN {starter_allowed} + GREATEST(credit_minutes - {starter_legacy}, 0) * 60 "
+            f"WHEN 'creator' THEN {creator_allowed} + GREATEST(credit_minutes - {creator_legacy}, 0) * 60 "
+            f"WHEN 'pro' THEN {pro_allowed} + GREATEST(credit_minutes - {pro_legacy}, 0) * 60 "
+            f"ELSE {free_allowed} + GREATEST(credit_minutes - {free_legacy}, 0) * 60 "
+            "END "
+            "WHERE seconds_balance = 0 AND (credit_minutes > 0 OR chars_balance > 0)"
+        ))
+        await conn.execute(text(
+            "UPDATE users "
+            "SET credit_minutes = CAST(CEIL(seconds_balance / 60.0) AS INTEGER)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE users ALTER COLUMN seconds_balance SET DEFAULT 420"
         ))
         # ── Projects & Folders workspace migration ──────────────────────────
         # folders table (created by Base.metadata.create_all above if not present,

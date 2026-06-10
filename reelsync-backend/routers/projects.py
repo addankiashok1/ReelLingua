@@ -30,9 +30,11 @@ from fastapi import (
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from config import PROFITABLE_TIERS, STORAGE_DIR
+from billing import get_generation_block_reason
+from config import STORAGE_DIR
 from core.pipeline import run_background_job
 from database import get_db
+from media_probe import probe_video_duration_seconds
 from models.db_models import Project, RenderJob, User
 from models.schemas import (
     ProcessResponse,
@@ -267,13 +269,6 @@ async def add_scene(
             detail=f"Unsupported media type '{file.content_type}'.",
         )
 
-    plan = (current_user.subscription_plan or "free").lower()
-    if plan != "free" and current_user.credit_minutes < 1:
-        raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail=f"Insufficient credits ({current_user.credit_minutes} remaining).",
-        )
-
     user_input_dir = os.path.join(INPUT_DIR, str(current_user.id))
     os.makedirs(user_input_dir, exist_ok=True)
 
@@ -289,6 +284,33 @@ async def add_scene(
         fh.write(contents)
 
     logger.info(f"[add_scene] saved {len(contents):,} bytes → {local_path}")
+
+    try:
+        required_seconds = probe_video_duration_seconds(local_path)
+    except RuntimeError as exc:
+        try:
+            os.remove(local_path)
+        except OSError:
+            pass
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+    plan = (current_user.subscription_plan or "free").lower()
+    generation_block_reason = get_generation_block_reason(
+        plan,
+        current_user.seconds_balance,
+        required_seconds,
+    )
+    if generation_block_reason:
+        try:
+            os.remove(local_path)
+        except OSError:
+            pass
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail=generation_block_reason,
+        )
 
     clean_scene_name = (scene_name or "").strip() or None
     job = RenderJob(

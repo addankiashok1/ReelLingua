@@ -145,6 +145,7 @@ interface SceneItem {
 interface ExplorerContents {
   project_id: string
   project_name: string
+  project_original_video_path: string | null
   current_folder_id: string | null
   folders: FolderItem[]
   scenes: SceneItem[]
@@ -565,10 +566,12 @@ function VideoPreviewModal({ url, onClose }: { url: string; onClose: () => void 
 
 function QCComparisonModal({
   scene,
+  projectOriginalVideoPath,
   token,
   onClose,
 }: {
   scene: SceneItem
+  projectOriginalVideoPath: string | null
   token: string
   onClose: () => void
 }) {
@@ -578,9 +581,10 @@ function QCComparisonModal({
     return () => document.removeEventListener('keydown', handler)
   }, [onClose])
 
-  const base           = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000'
+  const base = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000'
   const outputFilename = scene.output_video_path?.replace(/\\/g, '/').split('/').pop() ?? ''
-  const inputFilename  = scene.input_video_path?.replace(/\\/g, '/').split('/').pop() ?? ''
+  const effectiveInputPath = scene.input_video_path ?? projectOriginalVideoPath
+  const inputFilename = effectiveInputPath?.replace(/\\/g, '/').split('/').pop() ?? ''
   const download_url   = outputFilename
     ? `${base}/downloads/${outputFilename}?token=${encodeURIComponent(token)}`
     : ''
@@ -949,7 +953,7 @@ function EditSceneModal({
   const supportedVoiceCodes = new Set(VOICE_LANGUAGES.map(l => l.code))
   const [voiceLang,    setVoiceLang]    = useState(scene.target_voice_lang)
   const [subtitleLang, setSubtitleLang] = useState(scene.target_subtitle_lang ?? 'en')
-  // source_language may be an auto-detected code unsupported by ElevenLabs (e.g. 'te');
+  // source_language may be an auto-detected code unsupported by the voice provider (e.g. 'te');
   // fall back to 'auto' so the dropdown isn't silently stuck on a hidden bad value.
   const [sourceLang,   setSourceLang]   = useState(
     supportedVoiceCodes.has(scene.source_language ?? '') ? (scene.source_language ?? 'auto') : 'auto'
@@ -2391,6 +2395,7 @@ export default function ExplorerPage() {
       {selectedScene && (
         <QCComparisonModal
           scene={selectedScene}
+          projectOriginalVideoPath={contents?.project_original_video_path ?? null}
           token={token}
           onClose={() => setSelectedScene(null)}
         />

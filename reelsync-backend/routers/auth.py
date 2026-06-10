@@ -12,8 +12,8 @@ from sqlalchemy import delete, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from billing import BILLING_TIERS, plan_from_db
-from config import PROFITABLE_TIERS, settings
+from billing import BILLING_TIERS, get_cycle_allocation, plan_from_db
+from config import settings
 from database import get_db
 from models.db_models import OTPVerification, PasswordResetOTP, User
 from models.schemas import (
@@ -238,15 +238,16 @@ async def verify_otp(body: OTPVerify, db: AsyncSession = Depends(get_db)):
     # OTP correct — final duplicate guard against race conditions
     await _check_conflicts(db, record.email, record.phone_number)
 
-    _INITIAL_CREDITS = 3
+    initial_allocation = get_cycle_allocation("FREE")
     new_user = User(
         id=uuid.uuid4(),
         email=record.email,
         phone_number=record.phone_number,
         hashed_password=record.hashed_password,
-        credit_minutes=_INITIAL_CREDITS,
+        credit_minutes=initial_allocation["credit_minutes"],
+        seconds_balance=initial_allocation["seconds_balance"],
         subscription_plan="free",
-        chars_balance=PROFITABLE_TIERS["free"]["chars_per_credit_minute"] * _INITIAL_CREDITS,
+        chars_balance=initial_allocation["chars_balance"],
     )
 
     try:
@@ -316,8 +317,10 @@ async def me(current_user: User = Depends(get_current_user)):
         user_id=str(current_user.id),
         email=current_user.email,
         credit_minutes=current_user.credit_minutes,
+        credit_seconds=current_user.seconds_balance or 0,
         subscription_plan=current_user.subscription_plan or "free",
         credit_limit_minutes=tier["min_limit"],
+        credit_limit_seconds=tier["allowed_seconds"],
         phone_number=current_user.phone_number,
         profile_picture_url=current_user.profile_picture_url,
     )

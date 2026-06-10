@@ -33,9 +33,11 @@ from fastapi import (
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from billing import get_generation_block_reason
 from config import STORAGE_DIR, THUMBNAILS_DIR
 from core.pipeline import run_background_job
 from database import get_db
+from media_probe import probe_video_duration_seconds, probe_video_height
 from models.db_models import ExplorerFolder, Project, RenderJob, SceneEditHistory, User
 from models.schemas import (
     ExplorerContentsResponse,
@@ -218,6 +220,7 @@ async def get_contents(
     return ExplorerContentsResponse(
         project_id=str(project.id),
         project_name=project.title,
+        project_original_video_path=project.original_video_path,
         current_folder_id=str(current_fid) if current_fid else None,
         folders=[_folder_item(f) for f in folders],
         scenes=[_scene_item(j) for j in scenes],
@@ -383,13 +386,6 @@ async def create_scene(
             detail=f"Unsupported media type '{file.content_type}'.",
         )
 
-    plan = (current_user.subscription_plan or "free").lower()
-    if plan != "free" and current_user.credit_minutes < 1:
-        raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail=f"Insufficient credits ({current_user.credit_minutes} remaining).",
-        )
-
     # ── Save uploaded file ────────────────────────────────────────────────────
     user_input_dir = os.path.join(INPUT_DIR, str(current_user.id))
     os.makedirs(user_input_dir, exist_ok=True)
@@ -408,6 +404,33 @@ async def create_scene(
     logger.info(f"[explorer] saved {len(contents):,} bytes → {local_path}")
 
     # ── Extract native resolution via ffprobe ─────────────────────────────────
+    try:
+        required_seconds = probe_video_duration_seconds(local_path)
+    except RuntimeError as exc:
+        try:
+            os.remove(local_path)
+        except OSError:
+            pass
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+    plan = (current_user.subscription_plan or "free").lower()
+    generation_block_reason = get_generation_block_reason(
+        plan,
+        current_user.seconds_balance,
+        required_seconds,
+    )
+    if generation_block_reason:
+        try:
+            os.remove(local_path)
+        except OSError:
+            pass
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail=generation_block_reason,
+        )
+
     native_height: int = get_video_height(local_path)
 
     # Cap the requested output_height to the native resolution.
@@ -655,11 +678,23 @@ async def reprocess_scene(
             detail="Original video file is no longer available for reprocessing.",
         )
 
+    try:
+        required_seconds = probe_video_duration_seconds(job.input_video_path)
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
     plan = (current_user.subscription_plan or "free").lower()
-    if plan != "free" and current_user.credit_minutes < 1:
+    generation_block_reason = get_generation_block_reason(
+        plan,
+        current_user.seconds_balance,
+        required_seconds,
+    )
+    if generation_block_reason:
         raise HTTPException(
             status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail=f"Insufficient credits ({current_user.credit_minutes} remaining).",
+            detail=generation_block_reason,
         )
 
     # Save current settings + file paths to history before overwriting.

@@ -10,8 +10,8 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from billing import BILLING_TIERS
-from config import PROFITABLE_TIERS, settings
+from billing import BILLING_TIERS, get_cycle_allocation, minutes_to_seconds, sync_display_minutes
+from config import settings
 from database import get_db
 from models.db_models import PaymentTransaction, User
 from models.schemas import InitiatePaymentRequest, SubscribeRequest
@@ -200,7 +200,11 @@ async def subscribe(
 
     # ── FREE: direct plan switch, no payment ─────────────────────────────────
     if target_plan == "FREE":
+        allocation = get_cycle_allocation("FREE")
         current_user.subscription_plan = "free"
+        current_user.credit_minutes = allocation["credit_minutes"]
+        current_user.seconds_balance = allocation["seconds_balance"]
+        current_user.chars_balance = 0
         db.add(current_user)
         await db.commit()
         logger.info(f"[payments/subscribe] user={current_user.id} → FREE (direct)")
@@ -210,12 +214,13 @@ async def subscribe(
     merchant_txn_id = uuid.uuid4().hex  # 32 hex chars, within PhonePe's 38-char limit
     package_id = f"sub_{target_plan}"   # "sub_STARTER", "sub_CREATOR", "sub_PRO"
 
+    allocation = get_cycle_allocation(target_plan)
     txn = PaymentTransaction(
         id=uuid.uuid4(),
         user_id=current_user.id,
         merchant_txn_id=merchant_txn_id,
         package_id=package_id,
-        credits=tier["min_limit"],
+        credits=allocation["credit_minutes"],
         amount_paise=tier["amount_paise"],
         status="PENDING",
     )
@@ -412,36 +417,37 @@ async def phonepe_webhook(
         )
 
     if txn.package_id.startswith("sub_"):
-        # Subscription plan purchase — grant plan's monthly allocation and update plan
+        # Subscription plan purchase — assign the current cycle's throttled allocation
         sub_plan_key = txn.package_id[4:]  # "STARTER", "CREATOR", "PRO"
         sub_tier = BILLING_TIERS.get(sub_plan_key)
         if sub_tier:
-            credits_to_add = sub_tier["min_limit"]
-            chars_to_add   = sub_tier["char_limit"]
+            allocation = get_cycle_allocation(sub_plan_key)
+            credits_to_add = allocation["credit_minutes"]
+            seconds_to_add = allocation["seconds_balance"]
             user.subscription_plan = sub_plan_key.lower()
+            user.credit_minutes = credits_to_add
+            user.seconds_balance = seconds_to_add
+            user.chars_balance = 0
         else:
-            # Fallback: treat as a credit pack using the user's current plan rates
-            current_plan = user.subscription_plan or "free"
-            fallback_tier = PROFITABLE_TIERS.get(current_plan, PROFITABLE_TIERS["free"])
             credits_to_add = txn.credits
-            chars_to_add   = fallback_tier["chars_per_credit_minute"] * txn.credits
+            seconds_to_add = minutes_to_seconds(txn.credits)
+            user.seconds_balance = (user.seconds_balance or 0) + seconds_to_add
+            user.credit_minutes = sync_display_minutes(user.seconds_balance)
+            user.chars_balance = 0
     else:
-        # One-time credit top-up pack — chars based on the user's current plan rate
-        current_plan = user.subscription_plan or "free"
-        pack_tier    = PROFITABLE_TIERS.get(current_plan, PROFITABLE_TIERS["free"])
         credits_to_add = txn.credits
-        chars_to_add   = pack_tier["chars_per_credit_minute"] * txn.credits
-
-    user.credit_minutes += credits_to_add
-    user.chars_balance   = (user.chars_balance or 0) + chars_to_add
+        seconds_to_add = minutes_to_seconds(txn.credits)
+        user.seconds_balance = (user.seconds_balance or 0) + seconds_to_add
+        user.credit_minutes = sync_display_minutes(user.seconds_balance)
+        user.chars_balance = 0
     txn.status = "COMPLETED"
     db.add(user)
     db.add(txn)
     await db.commit()
 
     logger.info(
-        f"[payments/webhook] Credited user={user.id} +{credits_to_add} min "
-        f"+{chars_to_add} chars (pkg={txn.package_id}, plan={user.subscription_plan}) "
-        f"→ balance={user.credit_minutes} min / {user.chars_balance} chars"
+        f"[payments/webhook] Applied allocation for user={user.id} "
+        f"{credits_to_add} display-min / {seconds_to_add} sec (pkg={txn.package_id}, plan={user.subscription_plan}) "
+        f"→ balance={user.credit_minutes} min / {user.seconds_balance} sec"
     )
     return {"status": "OK", "credited": credits_to_add}

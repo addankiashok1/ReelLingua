@@ -300,7 +300,7 @@ const THUMB_GRADIENTS = [
 const MILESTONES = [
   { key: 'STARTED',               pct: 5,   label: 'Started',   desc: 'Initializing project…',                     eta: '~45s' },
   { key: 'EXTRACTED_AUDIO',       pct: 20,  label: 'Extracted', desc: 'Extracting original source audio…',         eta: '~35s' },
-  { key: 'CLONED_AUDIO',          pct: 45,  label: 'Cloned',    desc: 'Cloning speech signatures via ElevenLabs…', eta: '~25s' },
+  { key: 'CLONED_AUDIO',          pct: 45,  label: 'Cloned',    desc: 'Cloning speech signatures…', eta: '~25s' },
   { key: 'DUBBING_COMPLETED',     pct: 65,  label: 'Dubbed',    desc: 'Audio localization complete…',              eta: '~15s' },
   { key: 'APPENDING_TO_VIDEO',    pct: 80,  label: 'Merging',   desc: 'Merging audio tracks & subtitles…',         eta: '~8s'  },
   { key: 'RENDERING_IN_PROGRESS', pct: 95,  label: 'Rendering', desc: 'Finalizing composition render pass…',       eta: '~3s'  },
@@ -449,7 +449,7 @@ function ApiBeacon() {
         <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500" />
       </span>
       <span className="text-[11px] font-medium text-emerald-400 tracking-wide whitespace-nowrap">
-        ElevenLabs Audio Cluster: Operational
+        Audio Dubbing Cluster: Operational
       </span>
     </div>
   )

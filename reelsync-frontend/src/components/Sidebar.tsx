@@ -1,16 +1,18 @@
 'use client'
 
 import Link from 'next/link'
-import { usePathname } from 'next/navigation'
-import { useEffect, useState } from 'react'
+import { usePathname, useRouter } from 'next/navigation'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import api from '@/utils/api'
 
 const CHARS_PER_MINUTE = 750
 
-interface ProfileSummary {
+interface UserProfile {
+  email: string
   credit_minutes: number
   credit_limit_minutes: number
   subscription_plan: string
+  profile_picture_url: string | null
 }
 
 interface SidebarProps {
@@ -59,6 +61,46 @@ function TrashIcon({ className }: { className?: string }) {
   )
 }
 
+function ProfileIcon({ className }: { className?: string }) {
+  return (
+    <svg className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" />
+    </svg>
+  )
+}
+
+function ChevronDownIcon({ className }: { className?: string }) {
+  return (
+    <svg className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
+    </svg>
+  )
+}
+
+function LogoutIcon({ className }: { className?: string }) {
+  return (
+    <svg className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M17 16l4-4m0 0l-4-4m4 4H9" />
+      <path strokeLinecap="round" strokeLinejoin="round" d="M13 5H7a2 2 0 00-2 2v10a2 2 0 002 2h6" />
+    </svg>
+  )
+}
+
+function getDisplayName(email: string | undefined): string {
+  if (!email) return 'Creator'
+  const local = email.split('@')[0]
+  const cleaned = local
+    .replace(/[._\-]/g, ' ')
+    .replace(/\d+/g, '')
+    .trim()
+    .split(' ')
+    .filter(Boolean)
+    .map(word => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(' ')
+
+  return cleaned || local
+}
+
 function SidebarLink({
   href,
   label,
@@ -95,8 +137,11 @@ function SidebarLink({
 
 export default function Sidebar({ collapsed, onToggle }: SidebarProps) {
   const pathname = usePathname()
+  const router = useRouter()
+  const profileWrapperRef = useRef<HTMLDivElement | null>(null)
   const [trashCount, setTrashCount] = useState(0)
-  const [profile, setProfile] = useState<ProfileSummary | null>(null)
+  const [profile, setProfile] = useState<UserProfile | null>(null)
+  const [isProfileDropdownOpen, setIsProfileDropdownOpen] = useState(false)
 
   useEffect(() => {
     api.get<{ count: number }>('/api/trash/count')
@@ -105,10 +150,27 @@ export default function Sidebar({ collapsed, onToggle }: SidebarProps) {
   }, [pathname])
 
   useEffect(() => {
-    api.get<ProfileSummary>('/api/auth/me')
+    api.get<UserProfile>('/api/auth/me')
       .then(res => setProfile(res.data))
       .catch(() => {})
   }, [])
+
+  useEffect(() => {
+    function handleDocumentMouseDown(event: MouseEvent) {
+      if (!profileWrapperRef.current?.contains(event.target as Node)) {
+        setIsProfileDropdownOpen(false)
+      }
+    }
+
+    document.addEventListener('mousedown', handleDocumentMouseDown)
+    return () => {
+      document.removeEventListener('mousedown', handleDocumentMouseDown)
+    }
+  }, [])
+
+  useEffect(() => {
+    setIsProfileDropdownOpen(false)
+  }, [collapsed, pathname])
 
   const credits = profile?.credit_minutes ?? 0
   const maxMin = profile?.credit_limit_minutes ?? 2
@@ -119,9 +181,19 @@ export default function Sidebar({ collapsed, onToggle }: SidebarProps) {
   const planLabel = profile?.subscription_plan
     ? `${profile.subscription_plan.charAt(0).toUpperCase()}${profile.subscription_plan.slice(1)}`
     : 'Free'
+  const displayName = useMemo(() => getDisplayName(profile?.email), [profile?.email])
+  const avatarSrc = profile?.profile_picture_url
+    ? `http://localhost:8000${profile.profile_picture_url}`
+    : null
+  const avatarInitial = (profile?.email?.charAt(0) ?? 'C').toUpperCase()
 
   const isActive = (href: string, exact = false) =>
     exact ? pathname === href : pathname.startsWith(href)
+
+  const handleSignOut = () => {
+    localStorage.clear()
+    router.replace('/login')
+  }
 
   return (
     <aside className={`flex shrink-0 flex-col border-r border-slate-800 bg-slate-950 transition-[width] duration-300 ${collapsed ? 'w-20' : 'w-60'}`}>
@@ -206,35 +278,88 @@ export default function Sidebar({ collapsed, onToggle }: SidebarProps) {
         </div>
       )}
 
-      <div className={`space-y-1 border-t border-slate-800/60 pt-3 ${collapsed ? 'px-2 pb-4' : 'px-3 pb-5'}`}>
-        <SidebarLink
-          href="/dashboard/trash"
-          label="Trash"
-          title="Trash"
-          active={pathname.startsWith('/dashboard/trash')}
-          collapsed={collapsed}
-          trailing={
-            trashCount > 0 ? (
-              <span className="rounded-full bg-slate-700 px-1.5 py-0.5 text-[10px] font-bold leading-none text-slate-300">
-                {trashCount > 99 ? '99+' : trashCount}
-              </span>
-            ) : undefined
-          }
-        >
-          <TrashIcon className="h-5 w-5" />
-        </SidebarLink>
+      <div className={`border-t border-slate-800/60 pt-3 ${collapsed ? 'px-2 pb-4' : 'px-3 pb-5'}`}>
+        <div className="space-y-1">
+          <SidebarLink
+            href="/dashboard/trash"
+            label="Trash"
+            title="Trash"
+            active={pathname.startsWith('/dashboard/trash')}
+            collapsed={collapsed}
+            trailing={
+              trashCount > 0 ? (
+                <span className="rounded-full bg-slate-700 px-1.5 py-0.5 text-[10px] font-bold leading-none text-slate-300">
+                  {trashCount > 99 ? '99+' : trashCount}
+                </span>
+              ) : undefined
+            }
+          >
+            <TrashIcon className="h-5 w-5" />
+          </SidebarLink>
+        </div>
 
-        <SidebarLink
-          href="/dashboard/profile"
-          label="Profile Settings"
-          title="Profile Settings"
-          active={pathname.startsWith('/dashboard/profile')}
-          collapsed={collapsed}
-        >
-          <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-            <path strokeLinecap="round" strokeLinejoin="round" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" />
-          </svg>
-        </SidebarLink>
+        <div ref={profileWrapperRef} className={`relative ${collapsed ? 'mt-2' : 'mt-3'}`}>
+          <button
+            type="button"
+            onClick={() => setIsProfileDropdownOpen(current => !current)}
+            className={`flex w-full items-center rounded-xl border border-slate-800 bg-slate-900/80 text-left transition-colors hover:border-slate-700 hover:bg-slate-900 ${
+              collapsed ? 'justify-center px-2 py-3' : 'gap-3 px-3 py-2.5'
+            }`}
+            aria-expanded={isProfileDropdownOpen}
+            aria-label={collapsed ? 'Open profile menu' : undefined}
+            title={collapsed ? 'Profile menu' : undefined}
+          >
+            {avatarSrc ? (
+              <img
+                src={avatarSrc}
+                alt="Profile avatar"
+                className="h-9 w-9 rounded-full object-cover ring-2 ring-slate-700"
+              />
+            ) : (
+              <span className="flex h-9 w-9 items-center justify-center rounded-full bg-gradient-to-br from-indigo-500 to-purple-600 text-sm font-bold text-white ring-2 ring-slate-700">
+                {avatarInitial}
+              </span>
+            )}
+
+            {!collapsed && (
+              <>
+                <div className="min-w-0 flex-1">
+                  <p className="truncate text-sm font-semibold text-white">{displayName}</p>
+                </div>
+                <ChevronDownIcon
+                  className={`h-4 w-4 flex-shrink-0 text-slate-500 transition-transform ${
+                    isProfileDropdownOpen ? 'rotate-180' : ''
+                  }`}
+                />
+              </>
+            )}
+          </button>
+
+          {isProfileDropdownOpen && (
+            <div className={`absolute z-50 w-56 space-y-1 rounded-xl border border-slate-800 bg-slate-900 p-2 shadow-2xl ${collapsed ? 'bottom-0 left-16' : 'bottom-14 left-4'}`}>
+              <div className="mb-1 break-all border-b border-slate-800 px-3 py-2 text-xs text-slate-400">
+                {profile?.email ?? 'Loading account...'}
+              </div>
+
+              <Link
+                href="/dashboard/profile"
+                className="flex items-center gap-2 rounded-lg px-3 py-2 text-xs text-slate-200 transition-colors hover:bg-slate-800"
+              >
+                <ProfileIcon className="h-4 w-4 text-slate-400" />
+                Profile Settings
+              </Link>
+
+              <button
+                type="button"
+                onClick={handleSignOut}
+                className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-xs text-rose-400 transition-colors hover:bg-rose-950/30"
+              >
+                <LogoutIcon className="h-4 w-4" />
+                Sign out
+              </button>
+            </div>
+          )}
+        </div>
       </div>
     </aside>
   )
