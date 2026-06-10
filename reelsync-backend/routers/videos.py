@@ -25,6 +25,7 @@ it already does.
 
 import logging
 import os
+import subprocess
 import uuid
 from typing import List, Optional
 
@@ -62,6 +63,30 @@ INPUT_DIR  = os.path.join(STORAGE_DIR, "inputs")
 OUTPUT_DIR = os.path.join(STORAGE_DIR, "outputs")
 
 
+def get_video_height(file_path: str) -> int:
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=height",
+                "-of", "json",
+                file_path,
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        data = __import__("json").loads(result.stdout)
+        height = int(data["streams"][0]["height"])
+        return height
+    except Exception as exc:
+        logger.warning(
+            f"[videos] ffprobe failed to detect height for {file_path}: {exc}"
+        )
+        return 720
+
+
 # ─── GET /history  (alias: /projects) ────────────────────────────────────────
 
 async def _list_projects(
@@ -96,6 +121,8 @@ async def _list_projects(
             latest_job_language=latest_job.target_language if latest_job else None,
             latest_job_subtitle_language=latest_job.subtitle_language if latest_job else None,
             latest_job_source_language=latest_job.source_language if latest_job else None,
+            latest_job_original_height=latest_job.original_height if latest_job else None,
+            latest_job_output_height=latest_job.output_height if latest_job else None,
             latest_job_scene_name=latest_job.scene_name if latest_job else None,
             latest_job_created_at=str(latest_job.created_at) if latest_job else None,
             latest_job_updated_at=str(latest_job.updated_at) if latest_job else None,
@@ -356,6 +383,11 @@ async def process_video(
     subtitle_lang = body.target_subtitle_language
     source_lang   = body.source_language  # "auto" or explicit code
     scene_name    = (body.scene_name or "").strip() or None  # None → use job_id as filename
+    output_height = body.target_resolution_height or 0
+    output_aspect_ratio = body.target_aspect_ratio or "original"
+    watermark_text = body.watermark_text or "ReelSync AI"
+    native_height = get_video_height(project.original_video_path)
+    is_upscale_required = output_height > native_height
 
     # Always INSERT a brand-new job row with a fresh UUID and timestamp.
     # Re-processing a project never touches prior job records — history is preserved.
@@ -366,6 +398,8 @@ async def process_video(
         target_language=voice_lang,
         subtitle_language=subtitle_lang,
         source_language=source_lang,
+        original_height=native_height,
+        output_height=output_height,
         status="PENDING",
     )
     db.add(job)
@@ -390,6 +424,10 @@ async def process_video(
         subtitle_lang=subtitle_lang,
         source_lang=source_lang,
         scene_name=scene_name or "",
+        output_height=output_height,
+        output_aspect_ratio=output_aspect_ratio,
+        watermark_text=watermark_text,
+        upscale_required=is_upscale_required,
     )
 
     return ProcessResponse(
@@ -536,6 +574,11 @@ async def rework_video(
     voice_lang    = body.target_voice_language
     subtitle_lang = body.target_subtitle_language
     source_lang   = body.source_language
+    output_height = body.target_resolution_height or 0
+    output_aspect_ratio = body.target_aspect_ratio or "original"
+    watermark_text = body.watermark_text or "ReelSync AI"
+    native_height = get_video_height(original.original_video_path)
+    is_upscale_required = output_height > native_height
 
     job = RenderJob(
         id=uuid.uuid4(),
@@ -544,6 +587,8 @@ async def rework_video(
         target_language=voice_lang,
         subtitle_language=subtitle_lang,
         source_language=source_lang,
+        original_height=native_height,
+        output_height=output_height,
         status="PENDING",
     )
     db.add(job)
@@ -566,6 +611,10 @@ async def rework_video(
         subtitle_lang=subtitle_lang,
         source_lang=source_lang,
         scene_name=scene_name,
+        output_height=output_height,
+        output_aspect_ratio=output_aspect_ratio,
+        watermark_text=watermark_text,
+        upscale_required=is_upscale_required,
     )
 
     return ProcessResponse(

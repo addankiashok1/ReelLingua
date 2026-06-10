@@ -57,6 +57,81 @@ const LANGUAGES = [
   { code: 'vi',  label: 'Vietnamese'  },
 ]
 
+const QUALITY_OPTIONS = [
+  { height: 360,  label: '360p',  factor: 1.0 },
+  { height: 480,  label: '480p',  factor: 1.3 },
+  { height: 720,  label: '720p',  factor: 1.8 },
+  { height: 1080, label: '1080p', factor: 2.4 },
+  { height: 1440, label: '1440p', factor: 3.8 },
+  { height: 2160, label: '2160p', factor: 5.5 },
+] as const
+
+function formatDuration(seconds: number) {
+  const mins = Math.floor(seconds / 60)
+  const secs = seconds % 60
+  if (mins > 0) {
+    return secs > 0 ? `≈ ${mins}m ${secs}s` : `≈ ${mins}m`
+  }
+  return `≈ ${secs}s`
+}
+
+const ASPECT_RATIO_OPTIONS = [
+  { value: 'original', label: 'Original' },
+  { value: '16:9', label: '16:9' },
+  { value: '9:16', label: '9:16' },
+] as const
+
+type AspectRatioValue = (typeof ASPECT_RATIO_OPTIONS)[number]['value']
+
+function normalizeAspectRatio(value: string): AspectRatioValue {
+  const normalized = value.trim().toLowerCase()
+  if (normalized === '16:9' || normalized === '9:16') return normalized
+  return 'original'
+}
+
+function makeTargetDimensions(
+  height: number,
+  aspectRatio: AspectRatioValue,
+  metadata: { width: number; height: number } | null,
+) {
+  if (aspectRatio === 'original' || !metadata) {
+    return {
+      width: metadata ? Math.max(2, Math.round((height * metadata.width) / metadata.height)) : 0,
+      height,
+    }
+  }
+
+  const [ratioW, ratioH] = aspectRatio === '16:9' ? [16, 9] : [9, 16]
+  let width = Math.round((height * ratioW) / ratioH)
+  if (width % 2 !== 0) width += 1
+
+  return { width, height }
+}
+
+function formatQualityLabel(
+  option: (typeof QUALITY_OPTIONS)[number],
+  aspectRatio: AspectRatioValue,
+  metadata: { width: number; height: number } | null,
+) {
+  if (!metadata) {
+    return option.label
+  }
+  const dims = makeTargetDimensions(option.height, aspectRatio, metadata)
+  if (aspectRatio === 'original') {
+    return `${dims.width}x${dims.height} (${option.label})`
+  }
+  return `${dims.width}x${dims.height}`
+}
+
+function estimateCompletionTime(height: number, aspectRatio: AspectRatioValue, aiEnhancement: boolean) {
+  const option = QUALITY_OPTIONS.find(opt => opt.height === height)
+  const factor = option?.factor ?? 1.0
+  const ratioPenalty = aspectRatio === 'original' ? 1.0 : 1.12
+  const enhancementPenalty = aiEnhancement ? 8.0 : 1.0
+  const baseline = 45
+  return formatDuration(Math.max(15, Math.round(baseline * factor * ratioPenalty * enhancementPenalty)))
+}
+
 const LANG_LABEL: Record<string, string> = Object.fromEntries(LANGUAGES.map(l => [l.code, l.label]))
 
 // Subtitle language options — exact codes accepted by deep-translator (GoogleTranslator)
@@ -260,6 +335,8 @@ interface ProjectHistoryItem {
   latest_job_language: string | null
   latest_job_subtitle_language: string | null
   latest_job_source_language: string | null
+  latest_job_original_height: number | null
+  latest_job_output_height: number | null
   latest_job_scene_name: string | null
   latest_job_created_at: string | null  // when the latest job was queued
   latest_job_updated_at: string | null  // last status change
@@ -276,24 +353,22 @@ interface UploadResponse {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-function getDisplayName(email: string): string {
-  const local = email.split('@')[0]
-  const cleaned = local
-    .replace(/[._\-]/g, ' ')
-    .replace(/\d+/g, '')
-    .trim()
-    .split(' ')
-    .filter(Boolean)
-    .map(w => w.charAt(0).toUpperCase() + w.slice(1))
-    .join(' ')
-  return cleaned || local
-}
-
-function getGreeting(name: string): string {
-  const h = new Date().getHours()
-  if (h < 12) return `Good morning, ${name}`
-  if (h < 17) return `Good afternoon, ${name}`
-  return `Good evening, ${name}`
+function detectVideoDimensions(file: File): Promise<{ width: number; height: number } | null> {
+  return new Promise(resolve => {
+    const video = document.createElement('video')
+    video.preload = 'metadata'
+    video.onloadedmetadata = () => {
+      const width = video.videoWidth
+      const height = video.videoHeight
+      URL.revokeObjectURL(video.src)
+      resolve(width > 0 && height > 0 ? { width, height } : null)
+    }
+    video.onerror = () => {
+      URL.revokeObjectURL(video.src)
+      resolve(null)
+    }
+    video.src = URL.createObjectURL(file)
+  })
 }
 
 function formatRelativeTime(dateStr: string | null): string {
@@ -477,6 +552,9 @@ export default function DashboardPage() {
   const [pageError,      setPageError]      = useState('')
   const [dragOver,       setDragOver]       = useState(false)
   const [selectedFile,   setSelectedFile]   = useState<File | null>(null)
+  const [videoMetadata,  setVideoMetadata]  = useState<{ width: number; height: number } | null>(null)
+  const [selectedResolution, setSelectedResolution] = useState<number>(360)
+  const [selectedAspectRatio, setSelectedAspectRatio] = useState<AspectRatioValue>('original')
   const [dropError,      setDropError]      = useState('')
   const [language,       setLanguage]       = useState('hi')
   const [titleInput,        setTitleInput]        = useState('')
@@ -605,7 +683,7 @@ export default function DashboardPage() {
     }
   }
 
-  const handleFile = (file: File) => {
+  const handleFile = async (file: File) => {
     if (!file.type.startsWith('video/')) {
       setDropError('Please select a valid video file (MP4, MOV, AVI).')
       return
@@ -615,11 +693,28 @@ export default function DashboardPage() {
     setUploadPhase('idle')
     setUploadError('')
     setTitleInput(deriveTitleFromFilename(file.name))
+
+    try {
+      const dims = await detectVideoDimensions(file)
+      if (dims) {
+        setVideoMetadata(dims)
+        setSelectedResolution(dims.height < 360 ? dims.height : 360)
+      } else {
+        setVideoMetadata(null)
+        setSelectedResolution(360)
+      }
+    } catch {
+      setVideoMetadata(null)
+      setSelectedResolution(360)
+    }
   }
 
   const handleRemoveFile = (e: React.MouseEvent) => {
     e.stopPropagation()
     setSelectedFile(null)
+    setVideoMetadata(null)
+    setSelectedResolution(360)
+    setSelectedAspectRatio('original')
     setTitleInput('')
     setUploadPhase('idle')
     setUploadError('')
@@ -664,8 +759,10 @@ export default function DashboardPage() {
 
       // Step 2 — queue the AI processing job
       await api.post(`/api/videos/process/${uploadData.project_id}`, {
-        target_voice_language:    language,
-        target_subtitle_language: subtitleLanguage,
+        target_voice_language:       language,
+        target_subtitle_language:    subtitleLanguage,
+        target_resolution_height:    selectedResolution,
+        target_aspect_ratio:         selectedAspectRatio,
       })
 
       setUploadProgress(100)
@@ -677,6 +774,9 @@ export default function DashboardPage() {
       // Auto-reset the drop zone after 4 s
       setTimeout(() => {
         setSelectedFile(null)
+        setVideoMetadata(null)
+        setSelectedResolution(360)
+        setSelectedAspectRatio('original')
         setTitleInput('')
         setUploadPhase('idle')
         setUploadProgress(0)
@@ -754,7 +854,39 @@ export default function DashboardPage() {
     return result
   }, [projects, searchQuery, statusFilter, dateFilter, sortField, sortDir])
 
-  // ── Loading ────────────────────────────────────────────────────────────────
+  // ── Derived values ─────────────────────────────────────────────────────────
+  const plan        = (profile?.subscription_plan ?? 'free').toLowerCase()
+  const isFree      = plan === 'free'
+  const planMeta    = PLAN_META[plan] ?? PLAN_META.free
+  const credits     = profile?.credit_minutes ?? 0
+  const maxMin      = profile?.credit_limit_minutes ?? 2
+  const totalChars  = maxMin * CHARS_PER_MINUTE
+  const availChars  = credits * CHARS_PER_MINUTE
+  const charPct     = totalChars > 0 ? (availChars / totalChars) * 100 : 0
+  const isUploading = uploadPhase === 'uploading'
+
+  const showResolutionSelector = Boolean(
+    selectedFile && uploadPhase !== 'uploading' && uploadPhase !== 'queued'
+  )
+
+  const availableResolutions = useMemo(() => QUALITY_OPTIONS, [])
+
+  const isAiEnhancementActive = Boolean(
+    videoMetadata && selectedResolution > videoMetadata.height
+  )
+
+  const estimatedCompletion = useMemo(
+    () => estimateCompletionTime(selectedResolution, selectedAspectRatio, isAiEnhancementActive),
+    [selectedResolution, selectedAspectRatio, isAiEnhancementActive],
+  )
+
+  useEffect(() => {
+    if (!availableResolutions.length) return
+    if (!availableResolutions.some(opt => opt.height === selectedResolution)) {
+      setSelectedResolution(availableResolutions[availableResolutions.length - 1].height)
+    }
+  }, [availableResolutions, selectedResolution])
+
   if (loading) {
     return (
       <div className="flex items-center justify-center h-full py-24">
@@ -766,19 +898,6 @@ export default function DashboardPage() {
     )
   }
 
-  // ── Derived values ─────────────────────────────────────────────────────────
-  const plan        = (profile?.subscription_plan ?? 'free').toLowerCase()
-  const isFree      = plan === 'free'
-  const planMeta    = PLAN_META[plan] ?? PLAN_META.free
-  const credits     = profile?.credit_minutes ?? 0
-  const maxMin      = profile?.credit_limit_minutes ?? 2
-  const totalChars  = maxMin * CHARS_PER_MINUTE
-  const availChars  = credits * CHARS_PER_MINUTE
-  const charPct     = totalChars > 0 ? (availChars / totalChars) * 100 : 0
-  const displayName = profile ? getDisplayName(profile.email) : 'Creator'
-  const greeting    = getGreeting(displayName)
-  const isActive    = credits > 0
-  const isUploading = uploadPhase === 'uploading'
   const canSubmit   = !!selectedFile && (isFree || credits > 0) && !isUploading && uploadPhase !== 'queued'
   const submitButtonLabel = uploadPhase === 'error'
     ? 'Retry upload'
@@ -1004,7 +1123,7 @@ export default function DashboardPage() {
       </div>
     )}
 
-    <div className="px-6 py-7 space-y-5 min-h-full">
+    <div className="flex min-h-full flex-col gap-4 px-4 py-4 sm:px-6 sm:py-5">
 
       {pageError && (
         <div className="bg-red-950/50 border border-red-800/40 text-red-400 text-sm rounded-xl px-5 py-3">
@@ -1012,184 +1131,9 @@ export default function DashboardPage() {
         </div>
       )}
 
-      {/* ── 1. Greeting Header Panel ─────────────────────────────────────────── */}
-      <div
-        className="relative overflow-hidden rounded-2xl border border-slate-800/80 px-8 py-6"
-        style={{ background: 'linear-gradient(135deg, #0f172a 0%, #0d1525 50%, #0f172a 100%)' }}
-      >
-        <div
-          className="pointer-events-none absolute inset-0 opacity-[0.035]"
-          style={{ backgroundImage: 'radial-gradient(circle, #ffffff 1px, transparent 1px)', backgroundSize: '22px 22px' }}
-        />
-        <div className="pointer-events-none absolute -top-20 -left-20 w-64 h-64 rounded-full bg-indigo-600/10 blur-3xl" />
-        <div className="pointer-events-none absolute -bottom-10 right-10 w-48 h-48 rounded-full bg-purple-600/8 blur-3xl" />
-
-        <div className="relative flex flex-col sm:flex-row sm:items-start sm:justify-between gap-5">
-          <div className="flex-1 min-w-0">
-            <div className="flex items-center gap-3 flex-wrap mb-4">
-              <h1 className="text-2xl font-black text-white tracking-tight leading-tight">{greeting}</h1>
-              <span
-                className={`inline-flex items-center gap-1.5 text-[11px] font-semibold px-3 py-1 rounded-full border ${
-                  isActive
-                    ? 'bg-emerald-950/70 border-emerald-800/60 text-emerald-400'
-                    : 'bg-amber-950/70 border-amber-800/60 text-amber-400'
-                }`}
-                style={{ boxShadow: isActive ? '0 0 14px rgba(16,185,129,0.2)' : '0 0 14px rgba(245,158,11,0.2)' }}
-              >
-                <span className={`w-1.5 h-1.5 rounded-full animate-pulse ${isActive ? 'bg-emerald-400' : 'bg-amber-400'}`} />
-                {isActive ? 'Active Creator' : 'Ready to Refuel'}
-              </span>
-            </div>
-            <div className="inline-flex items-start gap-2.5 bg-indigo-950/50 border border-indigo-900/50 rounded-xl px-4 py-2.5 max-w-2xl">
-              <svg className="w-3.5 h-3.5 text-indigo-400 mt-0.5 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M13 16h-1v-4h-1m1-4h.01M12 2a10 10 0 100 20A10 10 0 0012 2z" />
-              </svg>
-              <p className="text-xs text-indigo-300/80 leading-relaxed">{tip}</p>
-            </div>
-          </div>
-          <div className="flex-shrink-0 mt-1">
-            <ApiBeacon />
-          </div>
-        </div>
-      </div>
-
-      {/* ── 2. Analytics Metric Grid ─────────────────────────────────────────── */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
-
-        {/* Card A — Character Reservoir */}
-        <div className="bg-slate-950 border border-slate-800/80 rounded-2xl p-6 flex flex-col">
-          <div className="flex items-center justify-between mb-5">
-            <div>
-              <p className="text-[10px] font-semibold text-slate-500 uppercase tracking-widest">Character Reservoir</p>
-              <p className="text-sm text-slate-300 font-medium mt-0.5">Audio token budget</p>
-            </div>
-            <div className="w-9 h-9 rounded-xl bg-emerald-950/60 border border-emerald-800/40 flex items-center justify-center flex-shrink-0">
-              <svg className="w-4 h-4 text-emerald-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M9 19V6l12-3v13M9 19c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zm12-3c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zM9 10l12-3" />
-              </svg>
-            </div>
-          </div>
-          <CharReservoirRing pct={charPct} />
-          <div className="mt-5 pt-4 border-t border-slate-800/60 grid grid-cols-2 gap-2 text-center">
-            <div>
-              <p className="text-base font-black text-white tabular-nums leading-tight">{availChars.toLocaleString()}</p>
-              <p className="text-[10px] text-slate-600 mt-0.5">chars available</p>
-            </div>
-            <div>
-              <p className="text-base font-black text-slate-500 tabular-nums leading-tight">{totalChars.toLocaleString()}</p>
-              <p className="text-[10px] text-slate-600 mt-0.5">total chars</p>
-            </div>
-          </div>
-        </div>
-
-        {/* Card B — Processing Minutes */}
-        <div className="bg-slate-950 border border-slate-800/80 rounded-2xl p-6 flex flex-col">
-          <div className="flex items-center justify-between mb-5">
-            <div>
-              <p className="text-[10px] font-semibold text-slate-500 uppercase tracking-widest">Processing Time</p>
-              <p className="text-sm text-slate-300 font-medium mt-0.5">Remaining video minutes</p>
-            </div>
-            <div className="w-9 h-9 rounded-xl bg-indigo-950/60 border border-indigo-800/40 flex items-center justify-center flex-shrink-0">
-              <svg className="w-4 h-4 text-indigo-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                <circle cx="12" cy="12" r="10" />
-                <path strokeLinecap="round" d="M12 6v6l4 2" />
-              </svg>
-            </div>
-          </div>
-          <div className="flex-1 flex flex-col items-center justify-center py-2">
-            <span className="text-[64px] font-black text-white tabular-nums leading-none">{credits}</span>
-            <span className="text-slate-500 text-sm mt-2">of {maxMin} min remaining</span>
-          </div>
-          <div className="mt-4">
-            <div className="flex gap-px mb-2">
-              {Array.from({ length: 10 }).map((_, i) => {
-                const threshold = ((i + 1) / 10) * maxMin
-                const filled    = credits >= threshold
-                return (
-                  <div
-                    key={i}
-                    className="flex-1 h-2 rounded-sm transition-all duration-500"
-                    style={{ backgroundColor: filled ? '#6366f1' : '#1e293b', transitionDelay: `${i * 40}ms` }}
-                  />
-                )
-              })}
-            </div>
-            <div className="flex justify-between text-[10px] text-slate-600">
-              <span>0</span>
-              <span className="text-indigo-400 font-semibold tabular-nums">
-                {maxMin > 0 ? Math.round((credits / maxMin) * 100) : 0}% left
-              </span>
-              <span>{maxMin}</span>
-            </div>
-          </div>
-        </div>
-
-        {/* Card C — Subscription Status */}
-        <div
-          className={`relative overflow-hidden rounded-2xl border p-6 flex flex-col ${planMeta.bgClass} ${planMeta.borderClass}`}
-          style={{ boxShadow: `0 0 32px ${planMeta.ringColor}` }}
-        >
-          <div className="absolute inset-0 rounded-2xl border-2 animate-pulse pointer-events-none"
-            style={{ borderColor: planMeta.color, opacity: 0.15 }} />
-          <div className="pointer-events-none absolute -top-8 -right-8 w-32 h-32 rounded-full blur-2xl opacity-20"
-            style={{ backgroundColor: planMeta.color }} />
-
-          <div className="relative flex items-center justify-between mb-5">
-            <div>
-              <p className="text-[10px] font-semibold text-slate-500 uppercase tracking-widest">Subscription</p>
-              <p className="text-sm text-slate-300 font-medium mt-0.5">Active plan</p>
-            </div>
-            <div className="w-9 h-9 rounded-xl flex items-center justify-center flex-shrink-0"
-              style={{ backgroundColor: `${planMeta.color}18`, border: `1px solid ${planMeta.color}38` }}>
-              <svg className="w-4 h-4" style={{ color: planMeta.color }} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M3 10h18M7 15h1m4 0h1m-7 4h12a3 3 0 003-3V8a3 3 0 00-3-3H6a3 3 0 00-3 3v8a3 3 0 003 3z" />
-              </svg>
-            </div>
-          </div>
-
-          <div className="relative flex-1 flex flex-col items-center justify-center py-2">
-            <span className="text-[52px] font-black tracking-tight leading-none"
-              style={{ color: planMeta.color, textShadow: `0 0 40px ${planMeta.ringColor}` }}>
-              {planMeta.label}
-            </span>
-            <span className="text-[10px] text-slate-600 mt-2 uppercase tracking-widest">Monthly Plan</span>
-          </div>
-
-          <div className="relative mt-4 pt-4 border-t border-slate-800/50 space-y-3">
-            <div className="flex items-center justify-between text-xs">
-              <span className="text-slate-500">Allowance / cycle</span>
-              <span className={`font-semibold ${planMeta.textClass}`}>{maxMin} min</span>
-            </div>
-            <Link
-              href="/dashboard/billing"
-              className="flex items-center justify-center gap-2 w-full py-2.5 rounded-xl text-xs font-semibold transition-all"
-              style={{
-                backgroundColor: `${planMeta.color}12`,
-                border:           `1px solid ${planMeta.color}35`,
-                color:             planMeta.color,
-              }}
-            >
-              <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M7 11l5-5m0 0l5 5m-5-5v12" />
-              </svg>
-              Manage Plans
-            </Link>
-          </div>
-        </div>
-      </div>
-
       {/* ── 3. Fast-Track Studio Zone ────────────────────────────────────────── */}
-      <div className="bg-slate-950 border border-slate-800/80 rounded-2xl overflow-hidden">
-        <div className="px-7 py-5 border-b border-slate-800/60 flex items-center justify-between">
-          <div>
-            <h2 className="text-base font-bold text-white">Fast-Track Studio</h2>
-            <p className="text-xs text-slate-500 mt-0.5">
-              Drop a video, choose a language, and launch directly — no page change required
-            </p>
-          </div>
-        </div>
-
-        <div className="p-6 grid md:grid-cols-[1fr_280px] gap-5">
+      <div className="shrink-0 bg-slate-950 border border-slate-800/80 rounded-2xl overflow-hidden">
+        <div className="grid items-stretch gap-4 p-4 lg:grid-cols-[minmax(0,1.45fr)_minmax(300px,0.95fr)] xl:grid-cols-[minmax(0,1.7fr)_minmax(320px,0.9fr)]">
 
           {/* ── Drop Zone ───────────────────────────────────────────────────── */}
           <div
@@ -1199,7 +1143,7 @@ export default function DashboardPage() {
             onClick={() => {
               if (!selectedFile && uploadPhase === 'idle') fileInputRef.current?.click()
             }}
-            className={`relative flex flex-col items-center justify-center gap-4 rounded-2xl border-2 border-dashed min-h-[210px] px-8 py-10 transition-all duration-300 ${
+            className={`relative flex h-full min-h-[200px] flex-col items-center justify-center gap-2.5 rounded-2xl border-2 border-dashed px-5 py-5 transition-all duration-300 lg:min-h-[220px] ${
               isUploading || uploadPhase === 'queued'
                 ? 'border-slate-700/40 bg-slate-900/20 cursor-default'
                 : dragOver
@@ -1219,9 +1163,16 @@ export default function DashboardPage() {
               onChange={e => { if (e.target.files?.[0]) handleFile(e.target.files[0]) }}
             />
 
+            <div className="pointer-events-none absolute left-5 top-4 right-5 text-left">
+              <p className="text-sm font-semibold text-slate-200">Fast-Track Studio</p>
+              <p className="mt-1 max-w-md text-xs leading-relaxed text-slate-500">
+                Drop a video, choose a language, and launch directly — no page change required.
+              </p>
+            </div>
+
             {/* ── State: uploading ── */}
             {isUploading && (
-              <div className="w-full flex flex-col items-center gap-5">
+              <div className="w-full pt-12 flex flex-col items-center gap-5">
                 <div className="w-14 h-14 rounded-2xl bg-indigo-950/60 border border-indigo-800/40 flex items-center justify-center">
                   <svg className="w-7 h-7 text-indigo-400 animate-spin" fill="none" viewBox="0 0 24 24">
                     <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
@@ -1260,7 +1211,7 @@ export default function DashboardPage() {
 
             {/* ── State: queued (success) ── */}
             {uploadPhase === 'queued' && !isUploading && (
-              <div className="flex flex-col items-center gap-3 text-center">
+              <div className="flex flex-col items-center gap-3 pt-12 text-center">
                 <div className="w-14 h-14 rounded-2xl bg-emerald-950/60 border border-emerald-800/40 flex items-center justify-center">
                   <svg className="w-7 h-7 text-emerald-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                     <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
@@ -1275,7 +1226,7 @@ export default function DashboardPage() {
 
             {/* ── State: error ── */}
             {uploadPhase === 'error' && (
-              <div className="flex flex-col items-center gap-3 text-center">
+              <div className="flex flex-col items-center gap-3 pt-12 text-center">
                 <div className="w-14 h-14 rounded-2xl bg-red-950/60 border border-red-800/40 flex items-center justify-center">
                   <svg className="w-7 h-7 text-red-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                     <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
@@ -1296,7 +1247,7 @@ export default function DashboardPage() {
 
             {/* ── State: file selected, idle ── */}
             {selectedFile && uploadPhase === 'idle' && !isUploading && (
-              <div className="flex flex-col items-center gap-3 text-center">
+              <div className="flex flex-col items-center gap-3 pt-12 text-center">
                 <div className="w-14 h-14 rounded-2xl bg-emerald-950/60 border border-emerald-800/40 flex items-center justify-center">
                   <svg className="w-7 h-7 text-emerald-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
                     <path strokeLinecap="round" strokeLinejoin="round" d="M15 10l4.553-2.069A1 1 0 0121 8.882v6.236a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
@@ -1328,7 +1279,7 @@ export default function DashboardPage() {
 
             {/* ── State: no file (idle) ── */}
             {!selectedFile && uploadPhase === 'idle' && (
-              <>
+              <div className="flex flex-col items-center gap-2.5 pt-12 text-center">
                 <div className="relative">
                   <div className={`w-16 h-16 rounded-2xl flex items-center justify-center transition-all duration-300 ${
                     dragOver ? 'bg-indigo-600/20 border border-indigo-500/40 scale-110' : 'bg-slate-800/80 border border-slate-700/60'
@@ -1350,7 +1301,7 @@ export default function DashboardPage() {
                   </p>
                   <p className="text-xs text-slate-600 mt-1">MP4, MOV, AVI — or click to browse</p>
                 </div>
-              </>
+              </div>
             )}
 
             {dropError && (
@@ -1359,11 +1310,11 @@ export default function DashboardPage() {
           </div>
 
           {/* ── Config Panel ────────────────────────────────────────────────── */}
-          <div className="flex flex-col gap-4">
+          <div className="flex flex-col gap-3 rounded-2xl border border-slate-800/60 bg-slate-900/40 p-4">
 
             {/* Project title */}
             <div>
-              <label className="block text-[10px] font-semibold text-slate-500 uppercase tracking-widest mb-2">
+              <label className="block text-[10px] font-semibold text-slate-500 uppercase tracking-widest mb-1.5">
                 Project Title
               </label>
               <input
@@ -1373,13 +1324,13 @@ export default function DashboardPage() {
                 placeholder="Auto-filled from filename…"
                 maxLength={255}
                 disabled={isUploading || uploadPhase === 'queued'}
-                className="w-full bg-slate-900 border border-slate-700/80 rounded-xl px-4 py-2.5 text-sm text-white placeholder-slate-600 focus:outline-none focus:ring-2 focus:ring-indigo-500/40 focus:border-indigo-600/60 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+                className="w-full bg-slate-900 border border-slate-700/80 rounded-xl px-3 py-2 text-sm text-white placeholder-slate-600 focus:outline-none focus:ring-2 focus:ring-indigo-500/40 focus:border-indigo-600/60 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
               />
             </div>
 
             {/* Target language */}
             <div>
-              <label className="block text-[10px] font-semibold text-slate-500 uppercase tracking-widest mb-2">
+              <label className="block text-[10px] font-semibold text-slate-500 uppercase tracking-widest mb-1.5">
                 Target Language
               </label>
               <div className="relative">
@@ -1387,7 +1338,7 @@ export default function DashboardPage() {
                   value={language}
                   onChange={e => setLanguage(e.target.value)}
                   disabled={isUploading || uploadPhase === 'queued'}
-                  className="w-full bg-slate-900 border border-slate-700/80 rounded-xl px-4 py-3 text-sm text-white appearance-none focus:outline-none focus:ring-2 focus:ring-indigo-500/40 focus:border-indigo-600/60 cursor-pointer transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+                  className="w-full bg-slate-900 border border-slate-700/80 rounded-xl px-3 py-2.5 text-sm text-white appearance-none focus:outline-none focus:ring-2 focus:ring-indigo-500/40 focus:border-indigo-600/60 cursor-pointer transition-all disabled:opacity-40 disabled:cursor-not-allowed"
                 >
                   {LANGUAGES.map(l => (
                     <option key={l.code} value={l.code}>{l.label}</option>
@@ -1403,7 +1354,7 @@ export default function DashboardPage() {
 
             {/* Burn Subtitles Language */}
             <div>
-              <label className="block text-[10px] font-semibold text-slate-500 uppercase tracking-widest mb-2">
+              <label className="block text-[10px] font-semibold text-slate-500 uppercase tracking-widest mb-1.5">
                 Burn Subtitles Language
               </label>
               <div className="relative">
@@ -1411,7 +1362,7 @@ export default function DashboardPage() {
                   value={subtitleLanguage}
                   onChange={e => setSubtitleLanguage(e.target.value)}
                   disabled={isUploading || uploadPhase === 'queued'}
-                  className="w-full bg-slate-900 border border-slate-700/80 rounded-xl px-4 py-3 text-sm text-white appearance-none focus:outline-none focus:ring-2 focus:ring-indigo-500/40 focus:border-indigo-600/60 transition-all cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+                  className="w-full bg-slate-900 border border-slate-700/80 rounded-xl px-3 py-2.5 text-sm text-white appearance-none focus:outline-none focus:ring-2 focus:ring-indigo-500/40 focus:border-indigo-600/60 transition-all cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
                 >
                   {SUBTITLE_LANGUAGES.map(l => (
                     <option key={l.code} value={l.code}>{l.label}</option>
@@ -1426,7 +1377,7 @@ export default function DashboardPage() {
             </div>
 
             {/* Cost preview */}
-            <div className="bg-slate-900/80 border border-slate-800/60 rounded-xl px-4 py-3 space-y-2">
+            <div className="bg-slate-900/80 border border-slate-800/60 rounded-xl px-3 py-2 space-y-1.5">
               <div className="flex items-center justify-between text-xs">
                 <span className="text-slate-500">Credits required</span>
                 <span className="text-white font-semibold">1 credit</span>
@@ -1449,6 +1400,70 @@ export default function DashboardPage() {
               </div>
             </div>
 
+            {showResolutionSelector && (
+              <div className="bg-slate-900/80 border border-slate-800/60 rounded-xl px-4 py-4 space-y-3">
+                <div className="space-y-3">
+                  <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                    <div>
+                      <p className="text-xs text-slate-500 uppercase tracking-[0.22em] mb-1">Video aspect ratio</p>
+                      <p className="text-sm font-semibold text-white">{selectedAspectRatio === 'original' ? 'Original proportions' : selectedAspectRatio}</p>
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      {ASPECT_RATIO_OPTIONS.map(option => (
+                        <button
+                          key={option.value}
+                          type="button"
+                          onClick={() => setSelectedAspectRatio(option.value)}
+                          className={`rounded-full px-4 py-2 text-sm font-semibold transition-colors ${
+                            selectedAspectRatio === option.value
+                              ? 'bg-indigo-600 text-white'
+                              : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
+                          }`}
+                        >
+                          {option.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="flex items-center justify-between gap-3">
+                    <div>
+                      <p className="text-xs text-slate-500 uppercase tracking-[0.22em] mb-1">Output resolution</p>
+                      <p className="text-sm font-semibold text-white">
+                        {videoMetadata ? `${videoMetadata.width}x${videoMetadata.height} source detected` : 'Select a target resolution'}
+                      </p>
+                    </div>
+                    <div className="text-right">
+                      <p className="text-xs text-slate-500 uppercase tracking-[0.22em] mb-1">ETC</p>
+                      <p className="text-sm font-semibold text-white">{estimatedCompletion}</p>
+                    </div>
+                  </div>
+                </div>
+                <div>
+                  <select
+                    value={selectedResolution}
+                    onChange={e => setSelectedResolution(Number(e.target.value))}
+                    className="w-full bg-slate-900 border border-slate-700/80 rounded-xl px-4 py-3 text-sm text-white appearance-none focus:outline-none focus:ring-2 focus:ring-indigo-500/40 focus:border-indigo-600/60 transition-all"
+                  >
+                    {availableResolutions.map(option => (
+                      <option key={option.height} value={option.height}>
+                        {formatQualityLabel(option, selectedAspectRatio, videoMetadata)}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                {videoMetadata && videoMetadata.height < 360 ? (
+                  <p className="text-xs text-slate-500">
+                    Source resolution is below standard 360p, so the output will match the native source height.
+                  </p>
+                ) : (
+                  <p className="text-xs text-slate-500">
+                    The selected aspect ratio and output height are sent to the render API; the backend will preserve proportions with a scale/pad filter.
+                  </p>
+                )}
+              </div>
+            )}
+
             {/* Launch button */}
             <button
               type="button"
@@ -1456,7 +1471,7 @@ export default function DashboardPage() {
               disabled={isUploading || !selectedFile}
               aria-label={submitButtonLabel}
               title={submitButtonLabel}
-              className={`mt-auto w-full h-12 flex items-center justify-center rounded-xl font-semibold text-sm transition-all duration-200 gap-2.5 ${
+              className={`mt-auto w-full h-10 flex items-center justify-center rounded-xl font-semibold text-sm transition-all duration-200 gap-2.5 ${
                 (selectedFile && !isUploading)
                   ? 'bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-700 hover:to-purple-700 text-white shadow-lg cursor-pointer opacity-100'
                   : 'bg-slate-800 text-slate-400 cursor-not-allowed opacity-60'
@@ -1520,9 +1535,9 @@ export default function DashboardPage() {
       </div>
 
       {/* ── 4. Recent Renders Activity Stream ───────────────────────────────── */}
-      <div className="bg-slate-950 border border-slate-800/80 rounded-2xl overflow-hidden">
+      <div className="flex min-h-[420px] flex-1 flex-col bg-slate-950 border border-slate-800/80 rounded-2xl overflow-hidden">
         {/* ── Section header ──────────────────────────────────────────────── */}
-        <div className="px-7 py-5 border-b border-slate-800/60 flex items-center justify-between">
+        <div className="px-6 py-4 border-b border-slate-800/60 flex items-center justify-between">
           <div>
             <h2 className="text-base font-bold text-white">Recent Renders</h2>
             <p className="text-xs text-slate-500 mt-0.5">Your latest AI dubbing output history</p>
@@ -1545,7 +1560,7 @@ export default function DashboardPage() {
 
         {/* ── Search / Filter / Sort bar ───────────────────────────────────── */}
         {projects.length > 0 && (
-          <div className="px-6 py-3.5 border-b border-slate-800/60 flex flex-wrap gap-2.5 items-center">
+          <div className="px-6 py-3 border-b border-slate-800/60 flex flex-wrap gap-2.5 items-center">
             {/* Search input */}
             <div className="relative flex-1 min-w-[160px]">
               <svg className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-slate-500 pointer-events-none" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
@@ -1626,8 +1641,9 @@ export default function DashboardPage() {
           </div>
         )}
 
+        <div className="min-h-0 flex-1 overflow-y-auto">
         {projects.length === 0 ? (
-          <div className="flex flex-col items-center justify-center py-16 px-8">
+          <div className="flex h-full flex-col items-center justify-center py-16 px-8">
             <div className="w-14 h-14 rounded-2xl bg-slate-900 border border-slate-800 flex items-center justify-center mb-4">
               <svg className="w-6 h-6 text-slate-700" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
                 <path strokeLinecap="round" strokeLinejoin="round" d="M15 10l4.553-2.069A1 1 0 0121 8.882v6.236a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
@@ -1639,7 +1655,7 @@ export default function DashboardPage() {
             </p>
           </div>
         ) : filteredProjects.length === 0 ? (
-          <div className="flex flex-col items-center justify-center py-14 px-8">
+          <div className="flex h-full flex-col items-center justify-center py-14 px-8">
             <div className="w-12 h-12 rounded-2xl bg-slate-900 border border-slate-800 flex items-center justify-center mb-4">
               <svg className="w-5 h-5 text-slate-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
                 <path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-4.35-4.35M17 11A6 6 0 115 11a6 6 0 0112 0z" />
@@ -1679,6 +1695,9 @@ export default function DashboardPage() {
                   </th>
                   <th className="text-left px-4 py-3.5 hidden sm:table-cell">
                     <span className="text-[10px] font-semibold text-slate-600 uppercase tracking-widest">Subtitles</span>
+                  </th>
+                  <th className="text-left px-4 py-3.5 hidden sm:table-cell">
+                    <span className="text-[10px] font-semibold text-slate-600 uppercase tracking-widest">Resolution (Orig → Target)</span>
                   </th>
                   <th className="text-left px-4 py-3.5">
                     <button onClick={() => handleSort('status')} className="group flex items-center gap-1.5 text-[10px] font-semibold text-slate-600 hover:text-slate-400 uppercase tracking-widest transition-colors">
@@ -1761,6 +1780,17 @@ export default function DashboardPage() {
                               <path strokeLinecap="round" strokeLinejoin="round" d="M7 8h10M7 12h4m1 8l-4-4H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-3l-4 4z" />
                             </svg>
                             <span className="font-bold">{p.latest_job_subtitle_language.toUpperCase()}</span>
+                          </span>
+                        ) : (
+                          <span className="text-slate-700 text-xs">—</span>
+                        )}
+                      </td>
+
+                      {/* Resolution (Orig → Target) */}
+                      <td className="px-4 py-4 hidden sm:table-cell">
+                        {p.latest_job_original_height ? (
+                          <span className="text-xs text-slate-300">
+                            {p.latest_job_original_height}px → {p.latest_job_output_height && p.latest_job_output_height > 0 ? p.latest_job_output_height : p.latest_job_original_height}px
                           </span>
                         ) : (
                           <span className="text-slate-700 text-xs">—</span>
@@ -1854,6 +1884,7 @@ export default function DashboardPage() {
             </table>
           </div>
         )}
+        </div>
       </div>
 
     </div>

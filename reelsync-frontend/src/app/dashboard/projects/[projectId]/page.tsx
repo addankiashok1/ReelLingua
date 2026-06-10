@@ -81,9 +81,29 @@ const QUALITY_PRESETS = [
 ] as const
 
 /** Returns presets available for a given native height (never allows upscaling). */
+const DEFAULT_OUTPUT_HEIGHT = 720
+
 function availablePresets(nativeHeight: number | null) {
   if (!nativeHeight) return QUALITY_PRESETS
   return QUALITY_PRESETS.filter(p => p.height <= nativeHeight)
+}
+
+function getQualityLabel(outputHeight: number, nativeHeight: number | null) {
+  if (outputHeight === 0) {
+    return nativeHeight ? `Match source (${nativeHeight}p)` : 'Match source'
+  }
+  const preset = QUALITY_PRESETS.find(p => p.height === outputHeight)
+  return preset?.label ?? `${outputHeight}p`
+}
+
+function estimateRenderTime(outputHeight: number, nativeHeight: number | null) {
+  const height = outputHeight === 0 ? nativeHeight ?? DEFAULT_OUTPUT_HEIGHT : outputHeight
+  if (height <= 360) return '≈ 1m'
+  if (height <= 480) return '≈ 1m 15s'
+  if (height <= 720) return '≈ 1m 45s'
+  if (height <= 1080) return '≈ 2m 30s'
+  if (height <= 1440) return '≈ 4m'
+  return '≈ 6m'
 }
 
 /** Best-effort browser-side resolution detection before upload. */
@@ -693,13 +713,19 @@ function AddSceneModal({
     if (!f) return
     setFile(f)
     if (!sceneName) setSceneName(f.name.replace(/\.[^.]+$/, ''))
-    // Detect native resolution in-browser and reset quality to "Match Source"
     const h = await detectVideoHeight(f)
     setNativeHeight(h)
-    setOutputHeight(0)
+    if (h && h >= DEFAULT_OUTPUT_HEIGHT) {
+      setOutputHeight(DEFAULT_OUTPUT_HEIGHT)
+    } else {
+      setOutputHeight(0)
+    }
   }, [sceneName])
 
   const presets = availablePresets(nativeHeight)
+
+  const selectedQualityLabel = useMemo(() => getQualityLabel(outputHeight, nativeHeight), [outputHeight, nativeHeight])
+  const estimatedTime = useMemo(() => estimateRenderTime(outputHeight, nativeHeight), [outputHeight, nativeHeight])
 
   const handleSubmit = useCallback(async (e: React.FormEvent) => {
     e.preventDefault()
@@ -873,6 +899,24 @@ function AddSceneModal({
             </div>
           </div>
 
+          {file && (
+            <div className="rounded-2xl border border-slate-700 bg-slate-950 p-4 text-slate-300">
+              <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                <div>
+                  <p className="text-[10px] uppercase tracking-[0.24em] text-slate-500 mb-1">Estimated render time</p>
+                  <p className="text-sm font-semibold text-white">{estimatedTime}</p>
+                </div>
+                <div className="text-left sm:text-right">
+                  <p className="text-[10px] uppercase tracking-[0.24em] text-slate-500 mb-1">Output target</p>
+                  <p className="text-sm font-medium text-white">{selectedQualityLabel}</p>
+                </div>
+              </div>
+              <p className="mt-3 text-xs leading-5 text-slate-500">
+                Higher resolutions take longer to encode. If you choose a height above the source, the backend will keep the original native height.
+              </p>
+            </div>
+          )}
+
           {error && <p className="text-xs text-red-400">{error}</p>}
 
           <div className="flex gap-3 pt-1">
@@ -918,6 +962,14 @@ function EditSceneModal({
   // Presets capped to the original resolution — uses the server-derived value
   // so it is always accurate (not the browser estimate used during upload).
   const editPresets = availablePresets(scene.original_height ?? null)
+  const selectedQualityLabel = useMemo(
+    () => getQualityLabel(outputHeight, scene.original_height ?? null),
+    [outputHeight, scene.original_height]
+  )
+  const estimatedTime = useMemo(
+    () => estimateRenderTime(outputHeight, scene.original_height ?? null),
+    [outputHeight, scene.original_height]
+  )
 
   const handleSubmit = useCallback(async (e: React.FormEvent) => {
     e.preventDefault()
@@ -1037,6 +1089,22 @@ function EditSceneModal({
                 </button>
               ))}
             </div>
+          </div>
+
+          <div className="rounded-2xl border border-slate-700 bg-slate-950 p-4 text-slate-300">
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+              <div>
+                <p className="text-[10px] uppercase tracking-[0.24em] text-slate-500 mb-1">Estimated render time</p>
+                <p className="text-sm font-semibold text-white">{estimatedTime}</p>
+              </div>
+              <div className="text-left sm:text-right">
+                <p className="text-[10px] uppercase tracking-[0.24em] text-slate-500 mb-1">Output target</p>
+                <p className="text-sm font-medium text-white">{selectedQualityLabel}</p>
+              </div>
+            </div>
+            <p className="mt-3 text-xs leading-5 text-slate-500">
+              Higher resolutions take longer to encode. If you choose a height above the source, the backend will preserve the native resolution.
+            </p>
           </div>
 
           {error && <p className="text-xs text-red-400">{error}</p>}

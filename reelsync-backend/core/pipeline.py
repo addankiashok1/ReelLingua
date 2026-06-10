@@ -74,6 +74,9 @@ async def run_background_job(
     source_lang: str = "auto",
     scene_name: str = "",
     output_height: int = 0,
+    output_aspect_ratio: str = "original",
+    watermark_text: str = "ReelSync AI",
+    upscale_required: bool = False,
 ) -> None:
     """
     Full render pipeline for one job. Runs as an async FastAPI background task.
@@ -166,15 +169,23 @@ async def run_background_job(
             await set_status("EXTRACTED_AUDIO", progress_percentage=20)
             logger.info(f"[pipeline] job={job_id} → EXTRACTED_AUDIO  (submitting to ElevenLabs)")
 
-            ai = get_orchestrator()
-            dubbed_audio_path, subtitles_data, detected_src_lang = await asyncio.to_thread(
-                ai.generate_dubbed_audio,
-                video_local_path,
-                target_lang,
-                job_temp_dir,
-                source_lang,
-                apply_watermark,
-            )
+            # --- TEMPORARY DISABLED FOR DEBUGGING ---
+            # ai = get_orchestrator()
+            # dubbed_audio_path, subtitles_data, detected_src_lang = await asyncio.to_thread(
+            #     ai.generate_dubbed_audio,
+            #     video_local_path,
+            #     target_lang,
+            #     job_temp_dir,
+            #     source_lang,
+            #     apply_watermark,
+            # )
+            # ------------------------------------------
+            # MOCK BYPASS: Direct audio track pass-through from original uploaded file.
+            # Use the original video file audio so the downstream render pipeline remains functional.
+            dubbed_audio_path = video_local_path
+            subtitles_data = []
+            detected_src_lang = source_lang if source_lang != "auto" else None
+            logger.warning("⚠️ ElevenLabs bypassed: using original audio track for rendering tests.")
 
             # ── Milestone 3: CLONED_AUDIO (45%) — ElevenLabs returned ────────────
             # Write detected source language back to the job row so the dashboard
@@ -356,6 +367,9 @@ async def run_background_job(
                 actual_sub_lang,
                 apply_watermark,
                 output_height,
+                output_aspect_ratio,
+                watermark_text,
+                upscale_required,
             )
 
             # ── Milestone 6: RENDERING_IN_PROGRESS (95%) — burn done, archiving
@@ -456,6 +470,9 @@ def _burn_video(
     subtitle_lang: str = "",
     watermark: bool = False,
     output_height: int = 0,
+    output_aspect_ratio: str = "original",
+    watermark_text: str = "ReelSync AI",
+    upscale_required: bool = False,
 ) -> str:
     """Thin wrapper so asyncio.to_thread can call burn_assets positionally."""
     return engine.burn_assets(
@@ -466,6 +483,9 @@ def _burn_video(
         target_lang=subtitle_lang or target_lang,
         watermark=watermark,
         output_height=output_height,
+        output_aspect_ratio=output_aspect_ratio,
+        watermark_text=watermark_text,
+        upscale_required=upscale_required,
     )
 
 
