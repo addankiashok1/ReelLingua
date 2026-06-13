@@ -27,12 +27,18 @@ from fastapi import (
     UploadFile,
     status,
 )
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from config import PROFITABLE_TIERS, STORAGE_DIR
+from billing import (
+    verify_generation_access,
+    verify_workspace_access,
+    verify_workspace_project_quota,
+)
+from config import STORAGE_DIR
 from core.pipeline import run_background_job
 from database import get_db
+from media_probe import probe_video_duration_seconds
 from models.db_models import Project, RenderJob, User
 from models.schemas import (
     ProcessResponse,
@@ -61,6 +67,13 @@ def _project_response(project: Project) -> WorkspaceProjectResponse:
     )
 
 
+async def _require_workspace_access(current_user: User) -> None:
+    verify_workspace_access(
+        current_user=current_user,
+        logger=logger,
+    )
+
+
 # ─── POST /projects ───────────────────────────────────────────────────────────
 
 @router.post(
@@ -74,6 +87,18 @@ async def create_project(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _require_workspace_access(current_user)
+    current_project_count = await db.scalar(
+        select(func.count(Project.id))
+        .where(Project.user_id == current_user.id)
+        .where(Project.is_workspace == True)  # noqa: E712
+        .where(Project.trashed_at.is_(None))
+    )
+    verify_workspace_project_quota(
+        current_user=current_user,
+        current_project_count=int(current_project_count or 0),
+        logger=logger,
+    )
     project = Project(
         id=uuid.uuid4(),
         user_id=current_user.id,
@@ -99,6 +124,7 @@ async def list_projects(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _require_workspace_access(current_user)
     result = await db.execute(
         select(Project)
         .where(Project.user_id == current_user.id)
@@ -122,6 +148,7 @@ async def rename_project(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _require_workspace_access(current_user)
     try:
         pid = uuid.UUID(project_id)
     except ValueError:
@@ -150,6 +177,7 @@ async def delete_project(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _require_workspace_access(current_user)
     try:
         pid = uuid.UUID(project_id)
     except ValueError:
@@ -188,6 +216,7 @@ async def get_project_scenes(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _require_workspace_access(current_user)
     try:
         pid = uuid.UUID(project_id)
     except ValueError:
@@ -252,6 +281,7 @@ async def add_scene(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _require_workspace_access(current_user)
     try:
         pid = uuid.UUID(project_id)
     except ValueError:
@@ -265,13 +295,6 @@ async def add_scene(
         raise HTTPException(
             status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
             detail=f"Unsupported media type '{file.content_type}'.",
-        )
-
-    plan = (current_user.subscription_plan or "free").lower()
-    if plan != "free" and current_user.credit_minutes < 1:
-        raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail=f"Insufficient credits ({current_user.credit_minutes} remaining).",
         )
 
     user_input_dir = os.path.join(INPUT_DIR, str(current_user.id))
@@ -289,6 +312,30 @@ async def add_scene(
         fh.write(contents)
 
     logger.info(f"[add_scene] saved {len(contents):,} bytes → {local_path}")
+
+    try:
+        required_seconds = probe_video_duration_seconds(local_path)
+    except RuntimeError as exc:
+        try:
+            os.remove(local_path)
+        except OSError:
+            pass
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+    try:
+        verify_generation_access(
+            current_user=current_user,
+            incoming_video_duration=required_seconds,
+            logger=logger,
+        )
+    except HTTPException:
+        try:
+            os.remove(local_path)
+        except OSError:
+            pass
+        raise
 
     clean_scene_name = (scene_name or "").strip() or None
     job = RenderJob(

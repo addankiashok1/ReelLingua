@@ -1,5 +1,10 @@
 import logging
+import math
 import os
+import platform
+import shutil
+import subprocess
+from typing import Optional
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
@@ -103,6 +108,113 @@ def _load_font(size: int, lang: str = "") -> ImageFont.FreeTypeFont:
             continue
     logger.warning("No usable TrueType font found — using PIL default bitmap font.")
     return ImageFont.load_default()
+
+
+def _find_realesrgan_cli() -> Optional[str]:
+    for tool in ("realesrgan-ncnn-vulkan", "realesrgan-ncnn-vulkan.exe"):
+        path = shutil.which(tool)
+        if path:
+            return path
+    return None
+
+
+def _run_realesrgan_cli(input_path: str, output_path: str, scale: int) -> None:
+    cli = _find_realesrgan_cli()
+    if not cli:
+        raise RuntimeError("Real-ESRGAN CLI not found on PATH.")
+
+    command = [
+        cli,
+        "-i",
+        input_path,
+        "-o",
+        output_path,
+        "-s",
+        str(scale),
+    ]
+    subprocess.run(
+        command,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=3600,
+    )
+
+
+def _ffmpeg_scale(input_path: str, output_path: str, width: int, height: int) -> None:
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            input_path,
+            "-vf",
+            f"scale={width}:{height}:flags=lanczos",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "slow",
+            "-crf",
+            "18",
+            "-c:a",
+            "copy",
+            output_path,
+        ],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=3600,
+    )
+
+
+def _escape_drawtext_text(text: str) -> str:
+    return (
+        text.replace("\\", "\\\\")
+            .replace("'", "\\'")
+            .replace(":", "\\:")
+            .replace(",", "\\,")
+            .replace("%", "\\%")
+    )
+
+
+def get_system_font() -> str:
+    system = platform.system()
+    if system == "Windows":
+        windows_candidates = [
+            "C:/Windows/Fonts/arial.ttf",
+            "C:/Windows/Fonts/arialbd.ttf",
+            "C:/Windows/Fonts/segoeui.ttf",
+            "C:/Windows/Fonts/verdana.ttf",
+        ]
+        for path in windows_candidates:
+            if os.path.exists(path):
+                # FFmpeg on Windows accepts forward slashes and requires colon escaping.
+                return path.replace("\\", "/").replace(":", "\\:")
+        raise RuntimeError("No Windows font file found for FFmpeg drawtext watermark.")
+
+    if system == "Darwin":
+        mac_path = "/Library/Fonts/Arial.ttf"
+        if os.path.exists(mac_path):
+            return mac_path
+        raise RuntimeError("No macOS font file found for FFmpeg drawtext watermark.")
+
+    linux_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+    if os.path.exists(linux_path):
+        return linux_path
+    return "Arial"
+
+
+def _build_watermark_drawtext_filter(watermark_text: str) -> str:
+    text = _escape_drawtext_text(watermark_text)
+    fontfile = get_system_font()
+    return (
+        f"drawtext=text='{text}':"
+        f"fontfile='{fontfile}':"
+        f"fontsize=h/14:fontcolor=white@0.12:shadowcolor=black@0.10:shadowx=2:shadowy=2:"
+        f"x=(w-tw)/2:y=(h-th)/2:box=0"
+    )
 
 
 def _wrap_text(
@@ -240,32 +352,95 @@ class VideoEngine:
         target_lang: str = "",
         watermark: bool = False,
         output_height: int = 0,
+        output_aspect_ratio: str = "original",
+        watermark_text: str = "ReelSync AI",
+        upscale_required: bool = False,
     ) -> str:
         logger.info(f"Loading video: {original_video_path}")
         video = VideoFileClip(original_video_path)
 
-        # Build the FFmpeg scale filter string for the encoding pass.
-        # We intentionally do NOT resize the MoviePy clip here so that
-        # subtitle text and watermarks composite at the source resolution
-        # (sharpest possible glyphs).  The scale filter runs inside FFmpeg's
-        # encoding pipeline — one decode→composite→encode pass, no double
-        # transcoding.
-        #
-        # scale=-2:{h}  →  height is the user's requested value;
-        #                   width is auto-calculated to preserve aspect ratio
-        #                   and be divisible by 2 (H.264 requirement).
-        #
-        # A target height that is 0, None, or ≥ the source height means
-        # "match source" — we skip the filter entirely so FFmpeg never upscales.
+        native_w = video.w
         native_h = video.h
-        if output_height and 0 < output_height < native_h:
-            _scale_filter = ["-vf", f"scale=-2:{output_height}"]
-            logger.info(
-                f"[video_processor] FFmpeg scale filter will downscale "
-                f"{native_h}px → {output_height}px at encode time"
-            )
+        ffmpeg_params: list[str] = []
+        intermediate_output_path = output_path
+        target_w = native_w
+        target_h = native_h
+        processing_h = native_h
+
+        if output_aspect_ratio == "original":
+            if upscale_required and output_height and output_height > native_h:
+                intermediate_output_path = output_path + ".intermediate.mp4"
+                target_h = output_height
+                target_w = int(round(native_w * target_h / native_h))
+                target_w -= target_w % 2
+                logger.info(
+                    "[video_processor] AI upscale requested for original aspect ratio; "
+                    "creating a native-resolution intermediate before super-resolution"
+                )
+            elif output_height and 0 < output_height < native_h:
+                ffmpeg_params = ["-vf", f"scale=-2:{output_height}"]
+                target_h = output_height
+                target_w = int(round(native_w * target_h / native_h))
+                target_w -= target_w % 2
+                logger.info(
+                    f"[video_processor] FFmpeg scale filter will downscale "
+                    f"{native_h}px → {output_height}px at encode time"
+                )
         else:
-            _scale_filter = []
+            ratio_w, ratio_h = (16, 9) if output_aspect_ratio == "16:9" else (9, 16)
+            if output_height and output_height > 0:
+                desired_h = output_height
+            else:
+                desired_h = native_h
+
+            if upscale_required and desired_h > native_h:
+                processing_h = native_h
+            else:
+                processing_h = min(desired_h, native_h)
+
+            processing_w = int(round((processing_h * ratio_w) / ratio_h))
+            processing_w -= processing_w % 2
+            processing_h -= processing_h % 2
+
+            if processing_w > native_w:
+                processing_w = native_w - (native_w % 2)
+                processing_h = int(round((processing_w * ratio_h) / ratio_w))
+                processing_h -= processing_h % 2
+
+            target_h = desired_h
+            target_w = int(round((target_h * ratio_w) / ratio_h))
+            target_w -= target_w % 2
+
+            if processing_w > 0 and processing_h > 0 and (
+                processing_w != native_w or processing_h != native_h
+            ):
+                ffmpeg_params = [
+                    "-vf",
+                    (
+                        f"scale=w={processing_w}:h={processing_h}:force_original_aspect_ratio=decrease," +
+                        f"pad=w={processing_w}:h={processing_h}:x=(ow-iw)/2:y=(oh-ih)/2:color=black"
+                    ),
+                ]
+                logger.info(
+                    f"[video_processor] FFmpeg aspect filter will encode to "
+                    f"{processing_w}x{processing_h} ({output_aspect_ratio})"
+                )
+
+            if upscale_required and desired_h > native_h:
+                intermediate_output_path = output_path + ".intermediate.mp4"
+                logger.info(
+                    "[video_processor] AI upscale requested for aspect ratio change; "
+                    "creating a ratio-correct intermediate before super-resolution"
+                )
+
+        if watermark_text:
+            watermark_filter = _build_watermark_drawtext_filter(watermark_text)
+            if ffmpeg_params and ffmpeg_params[0] == "-vf":
+                ffmpeg_params[1] = f"{ffmpeg_params[1]},{watermark_filter}"
+            else:
+                ffmpeg_params = ["-vf", watermark_filter]
+
+        ffmpeg_params.extend(["-preset", "ultrafast", "-crf", "26"])
 
         logger.info(f"Loading dubbed audio: {dubbed_audio_path}")
         audio = AudioFileClip(dubbed_audio_path)
@@ -305,15 +480,37 @@ class VideoEngine:
         else:
             final = video_with_audio
 
-        logger.info(f"Writing output: {output_path}")
+        logger.info(f"Writing output: {intermediate_output_path}")
         final.write_videofile(
-            output_path,
+            intermediate_output_path,
             codec="libx264",
             audio_codec="aac",
-            temp_audiofile=output_path + ".temp_audio.m4a",
+            temp_audiofile=intermediate_output_path + ".temp_audio.m4a",
             remove_temp=True,
+            ffmpeg_params=ffmpeg_params,
             logger=None,
         )
+
+        if upscale_required and intermediate_output_path != output_path:
+            logger.info(
+                f"[video_processor] Performing AI super-resolution to target {target_w}x{target_h}"
+            )
+            scale = max(2, min(4, math.ceil(target_h / float(processing_h or 1))))
+            try:
+                _run_realesrgan_cli(intermediate_output_path, output_path, scale=scale)
+            except Exception as ai_exc:
+                logger.warning(
+                    f"AI upscaling failed ({ai_exc}); falling back to high-quality ffmpeg scaling"
+                )
+                _ffmpeg_scale(intermediate_output_path, output_path, target_w, target_h)
+            finally:
+                try:
+                    os.remove(intermediate_output_path)
+                except OSError:
+                    pass
+        else:
+            if intermediate_output_path != output_path:
+                shutil.move(intermediate_output_path, output_path)
 
         video.close()
         audio.close()

@@ -2,8 +2,12 @@
   "name": "reelsync-frontend",
   "version": "0.1.0",
   "private": true,
+  "engines": {
+    "node": ">=20.9 <24"
+  },
   "scripts": {
-    "dev": "node --max-old-space-size=4096 node_modules/.bin/next dev",
+    "dev": "node ./scripts/dev-server.mjs",
+    "dev:raw": "node --max-old-space-size=4096 ./node_modules/next/dist/bin/next dev --turbo",
     "build": "next build",
     "start": "next start",
     "lint": "next lint"

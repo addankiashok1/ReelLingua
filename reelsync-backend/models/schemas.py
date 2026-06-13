@@ -113,9 +113,18 @@ class Token(BaseModel):
 class UserOut(BaseModel):
     user_id: str
     email: str
+    role: str = "USER"
     credit_minutes: int
+    credit_seconds: int = 0
+    credit_balance_credits: int = 0
     subscription_plan: str = "free"
-    credit_limit_minutes: int = 2
+    credit_limit_minutes: int = 1
+    credit_limit_seconds: int = 0
+    credit_limit_credits: int = 0
+    advertised_credits: int = 0
+    allowed_minutes: int = 0
+    protected_credit_percent: int = 70
+    is_recurring: bool = True
     phone_number: Optional[str] = None
     profile_picture_url: Optional[str] = None
 
@@ -136,11 +145,14 @@ class ProjectHistoryItem(BaseModel):
     project_id: str
     title: str
     created_at: Optional[str] = None          # project upload date
+    original_video_path: Optional[str] = None
     latest_job_id: Optional[str] = None
     latest_job_status: Optional[str] = None
     latest_job_language: Optional[str] = None
     latest_job_subtitle_language: Optional[str] = None
     latest_job_source_language: Optional[str] = None
+    latest_job_original_height: Optional[int] = None  # native source height in pixels
+    latest_job_output_height: Optional[int] = None    # user-selected target height in pixels
     latest_job_scene_name: Optional[str] = None      # user-defined clip/scene label
     latest_job_created_at: Optional[str] = None      # when the latest job was queued
     latest_job_updated_at: Optional[str] = None      # last status change timestamp
@@ -289,11 +301,28 @@ class VideoProcess(BaseModel):
     target_voice_language: str
     target_subtitle_language: str = "en"
     source_language: str = "auto"   # "auto" lets ElevenLabs detect; or pass BCP-47 code
+    target_resolution_height: int = 360
+    target_aspect_ratio: str = "original"
+    watermark_text: str = "ReelSync AI"
+
+    @field_validator("watermark_text", mode="before")
+    @classmethod
+    def validate_watermark_text(cls, v: Optional[str]) -> str:
+        text = (v or "").strip()
+        return text if text else "ReelSync AI"
 
     @field_validator("target_voice_language")
     @classmethod
     def validate_voice_lang(cls, v: str) -> str:
         return _validate_lang_code(v)
+
+    @field_validator("target_aspect_ratio")
+    @classmethod
+    def validate_aspect_ratio(cls, v: str) -> str:
+        value = v.strip().lower()
+        if value in {"original", "16:9", "9:16"}:
+            return value
+        raise ValueError("target_aspect_ratio must be 'original', '16:9', or '9:16'.")
 
     @field_validator("target_subtitle_language")
     @classmethod
@@ -585,6 +614,7 @@ class ExplorerFolderItem(BaseModel):
 class ExplorerContentsResponse(BaseModel):
     project_id: str
     project_name: str
+    project_original_video_path: Optional[str] = None
     current_folder_id: Optional[str] = None
     folders: list[ExplorerFolderItem]
     scenes: list[SceneItem]

@@ -33,9 +33,15 @@ from fastapi import (
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from billing import (
+    clamp_render_output_height,
+    verify_generation_access,
+    verify_workspace_access,
+)
 from config import STORAGE_DIR, THUMBNAILS_DIR
 from core.pipeline import run_background_job
 from database import get_db
+from media_probe import probe_video_duration_seconds, probe_video_height
 from models.db_models import ExplorerFolder, Project, RenderJob, SceneEditHistory, User
 from models.schemas import (
     ExplorerContentsResponse,
@@ -60,7 +66,7 @@ INPUT_DIR = os.path.join(STORAGE_DIR, "inputs")
 
 # Supported output resolution presets (height in pixels).
 # The selected output_height must not exceed the video's original_height.
-RESOLUTION_PRESETS: frozenset[int] = frozenset({360, 480, 720, 1080, 1440, 2160})
+RESOLUTION_PRESETS: frozenset[int] = frozenset({360, 420, 480, 720, 1080, 1440, 2160})
 
 
 def get_video_height(file_path: str) -> int:
@@ -101,6 +107,10 @@ async def _get_workspace_project(
     db: AsyncSession,
 ) -> Project:
     """Fetch a workspace project and verify ownership. Raises 404 on any failure."""
+    verify_workspace_access(
+        current_user=current_user,
+        logger=logger,
+    )
     project: Optional[Project] = await db.get(Project, project_id)
     if not project or project.user_id != current_user.id or not project.is_workspace:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found.")
@@ -218,6 +228,7 @@ async def get_contents(
     return ExplorerContentsResponse(
         project_id=str(project.id),
         project_name=project.title,
+        project_original_video_path=project.original_video_path,
         current_folder_id=str(current_fid) if current_fid else None,
         folders=[_folder_item(f) for f in folders],
         scenes=[_scene_item(j) for j in scenes],
@@ -383,13 +394,6 @@ async def create_scene(
             detail=f"Unsupported media type '{file.content_type}'.",
         )
 
-    plan = (current_user.subscription_plan or "free").lower()
-    if plan != "free" and current_user.credit_minutes < 1:
-        raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail=f"Insufficient credits ({current_user.credit_minutes} remaining).",
-        )
-
     # ── Save uploaded file ────────────────────────────────────────────────────
     user_input_dir = os.path.join(INPUT_DIR, str(current_user.id))
     os.makedirs(user_input_dir, exist_ok=True)
@@ -408,13 +412,39 @@ async def create_scene(
     logger.info(f"[explorer] saved {len(contents):,} bytes → {local_path}")
 
     # ── Extract native resolution via ffprobe ─────────────────────────────────
+    try:
+        required_seconds = probe_video_duration_seconds(local_path)
+    except RuntimeError as exc:
+        try:
+            os.remove(local_path)
+        except OSError:
+            pass
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+    plan = (current_user.subscription_plan or "free").lower()
+    try:
+        verify_generation_access(
+            current_user=current_user,
+            incoming_video_duration=required_seconds,
+            logger=logger,
+        )
+    except HTTPException:
+        try:
+            os.remove(local_path)
+        except OSError:
+            pass
+        raise
+
     native_height: int = get_video_height(local_path)
 
-    # Cap the requested output_height to the native resolution.
-    # If output_height is 0 or exceeds the native height, match the source.
-    safe_output_height: Optional[int] = None
-    if output_height and 0 < output_height < native_height:
-        safe_output_height = output_height
+    safe_output_height = clamp_render_output_height(
+        plan,
+        output_height,
+        native_height,
+        allow_upscale=False,
+    )
 
     # ── Create RenderJob ──────────────────────────────────────────────────────
     clean_name = (scene_name or "").strip() or None
@@ -428,7 +458,7 @@ async def create_scene(
         source_language=source_language,
         input_video_path=local_path,
         original_height=native_height,
-        output_height=safe_output_height,
+        output_height=safe_output_height or None,
         status="PENDING",
     )
     db.add(job)
@@ -450,7 +480,7 @@ async def create_scene(
         subtitle_lang=subtitle_language,
         source_lang=source_language,
         scene_name=clean_name or "",
-        output_height=safe_output_height or 0,
+        output_height=safe_output_height,
     )
 
     return ProcessResponse(
@@ -655,12 +685,18 @@ async def reprocess_scene(
             detail="Original video file is no longer available for reprocessing.",
         )
 
-    plan = (current_user.subscription_plan or "free").lower()
-    if plan != "free" and current_user.credit_minutes < 1:
+    try:
+        required_seconds = probe_video_duration_seconds(job.input_video_path)
+    except RuntimeError as exc:
         raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail=f"Insufficient credits ({current_user.credit_minutes} remaining).",
-        )
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+    verify_generation_access(
+        current_user=current_user,
+        incoming_video_duration=required_seconds,
+        logger=logger,
+    )
 
     # Save current settings + file paths to history before overwriting.
     # We deliberately keep the old output file on disk so users can still
@@ -676,19 +712,18 @@ async def reprocess_scene(
     )
     db.add(history_entry)
 
-    # Cap output_height to the original resolution so it is never upscaled
-    if body.output_height and job.original_height:
-        reprocess_output_height = min(body.output_height, job.original_height)
-    elif body.output_height:
-        reprocess_output_height = body.output_height
-    else:
-        reprocess_output_height = job.output_height or 0
+    reprocess_output_height = clamp_render_output_height(
+        current_user.subscription_plan,
+        body.output_height if body.output_height is not None else (job.output_height or 0),
+        job.original_height,
+        allow_upscale=False,
+    )
 
     # Update job with new language settings, resolution, and reset pipeline state
     job.target_language = body.target_voice_lang
     job.subtitle_language = body.target_subtitle_lang
     job.source_language = body.source_language
-    job.output_height = reprocess_output_height if reprocess_output_height else None
+    job.output_height = reprocess_output_height or None
     job.status = "PENDING"
     job.progress_percentage = 0
     job.output_video_path = None

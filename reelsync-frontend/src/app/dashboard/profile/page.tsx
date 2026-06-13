@@ -5,6 +5,7 @@ import { useRouter } from 'next/navigation'
 import Link from 'next/link'
 import axios from 'axios'
 import api from '@/utils/api'
+import { broadcastProfileRefresh, useSessionProfile } from '@/hooks/useSessionProfile'
 
 const API_BASE = 'http://localhost:8000'
 
@@ -21,6 +22,7 @@ function ringStroke(pct: number): string {
 interface UserProfile {
   user_id: string
   email: string
+  role?: string
   credit_minutes: number
   credit_limit_minutes: number
   subscription_plan: string
@@ -28,12 +30,17 @@ interface UserProfile {
   profile_picture_url: string | null
 }
 
+function formatRole(role: string | undefined): string {
+  const value = (role ?? 'USER').toUpperCase()
+  if (value === 'ROOT') return 'ROOT Access'
+  if (value === 'ADMIN') return 'Admin Access'
+  return 'User Access'
+}
+
 export default function ProfilePage() {
   const router = useRouter()
   const fileInputRef = useRef<HTMLInputElement>(null)
 
-  const [profile, setProfile]     = useState<UserProfile | null>(null)
-  const [loading, setLoading]     = useState(true)
   const [avatarSrc, setAvatarSrc] = useState<string | null>(null)
   const [uploading, setUploading] = useState(false)
   const [removing, setRemoving]   = useState(false)
@@ -47,32 +54,29 @@ export default function ProfilePage() {
   const [pwError, setPwError]       = useState('')
   const [pwSuccess, setPwSuccess]   = useState('')
 
+  const {
+    profile,
+    setProfile,
+    loading,
+    refreshProfile,
+  } = useSessionProfile<UserProfile>({
+    redirectOnUnauthorized: true,
+    onUnauthorized: () => router.replace('/login'),
+  })
+
   useEffect(() => {
     const token = localStorage.getItem('access_token')
     if (!token) { router.replace('/login'); return }
-    fetchProfile()
   }, [])
 
-  const fetchProfile = async () => {
-    try {
-      const { data } = await api.get<UserProfile>('/api/auth/me')
-      setProfile(data)
-      setAvatarSrc(
-        data.profile_picture_url
-          ? `${API_BASE}${data.profile_picture_url}?v=${Date.now()}`
-          : null,
-      )
-    } catch (err) {
-      if (axios.isAxiosError(err) && err.response?.status === 401) {
-        localStorage.clear()
-        router.replace('/login')
-      } else {
-        setError('Failed to load profile.')
-      }
-    } finally {
-      setLoading(false)
-    }
-  }
+  useEffect(() => {
+    if (!profile) return
+    setAvatarSrc(
+      profile.profile_picture_url
+        ? `${API_BASE}${profile.profile_picture_url}?v=${Date.now()}`
+        : null,
+    )
+  }, [profile])
 
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
@@ -97,6 +101,7 @@ export default function ProfilePage() {
       )
       setAvatarSrc(`${API_BASE}${data.profile_picture_url}?v=${Date.now()}`)
       setProfile(prev => prev ? { ...prev, profile_picture_url: data.profile_picture_url } : prev)
+      broadcastProfileRefresh()
       setSuccess('Profile picture updated.')
     } catch (err) {
       setError(axios.isAxiosError(err) ? (err.response?.data?.detail || 'Upload failed.') : 'Upload failed.')
@@ -113,6 +118,7 @@ export default function ProfilePage() {
       await api.delete('/api/user/profile-picture')
       setAvatarSrc(null)
       setProfile(prev => prev ? { ...prev, profile_picture_url: null } : prev)
+      broadcastProfileRefresh()
       setSuccess('Profile picture removed.')
     } catch (err) {
       setError(axios.isAxiosError(err) ? (err.response?.data?.detail || 'Remove failed.') : 'Remove failed.')
@@ -161,6 +167,7 @@ export default function ProfilePage() {
   const initial        = profile ? profile.email.charAt(0).toUpperCase() : '?'
   const planLabel      = (profile?.subscription_plan ?? 'free')
     .charAt(0).toUpperCase() + (profile?.subscription_plan ?? 'free').slice(1)
+  const roleLabel      = formatRole(profile?.role)
 
   return (
     <div className="max-w-xl mx-auto px-6 py-12">
@@ -249,6 +256,9 @@ export default function ProfilePage() {
         </div>
 
         <p className="text-base font-semibold text-gray-900 text-center">{profile?.email}</p>
+        <p className="mt-1 text-xs font-semibold uppercase tracking-[0.24em] text-indigo-600">
+          {roleLabel}
+        </p>
         <p className="text-xs text-gray-400 mt-0.5 tabular-nums">
           {credits} / {totalMinutes} min &middot; {Math.round(utilizationPct)}% utilized
         </p>

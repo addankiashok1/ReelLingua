@@ -22,13 +22,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from sqlalchemy import update
+from sqlalchemy import Integer, case, cast, func, update
 
 import config
-from config import MAX_CONCURRENT_JOBS, PROFITABLE_TIERS
+from config import MAX_CONCURRENT_JOBS
 from core.ai_client import get_orchestrator, parse_srt
 from core.subtitle_translator import translate_srt_file, translate_subtitles_data
 from core.video_processor import VideoEngine
+from media_probe import probe_video_duration_seconds
 
 logging.basicConfig(
     level=logging.INFO,
@@ -50,12 +51,11 @@ _job_semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 
 # Structured error payload stored in render_jobs.error_message when a job is
 # blocked by the character-density guard. Frontend should parse this as JSON.
-_DENSE_TEXT_ERROR = json.dumps({
-    "error_code": "DENSE_TEXT_LIMIT",
+_USAGE_LIMIT_ERROR = json.dumps({
+    "error_code": "CYCLE_DURATION_LIMIT",
     "message": (
-        "This video contains too many spoken words for your remaining plan balance. "
-        "Please shorten the script or upgrade your subscription plan to process "
-        "word-dense content."
+        "This render needs more time than your remaining plan balance allows. "
+        "Please shorten the video, wait for the next cycle, or upgrade your subscription plan."
     ),
 })
 
@@ -74,6 +74,9 @@ async def run_background_job(
     source_lang: str = "auto",
     scene_name: str = "",
     output_height: int = 0,
+    output_aspect_ratio: str = "original",
+    watermark_text: str = "ReelSync AI",
+    upscale_required: bool = False,
 ) -> None:
     """
     Full render pipeline for one job. Runs as an async FastAPI background task.
@@ -140,8 +143,7 @@ async def run_background_job(
         job_temp_dir = os.path.join(config.TEMP_DIR, job_id)
         os.makedirs(job_temp_dir, exist_ok=True)
 
-        # Populated after ElevenLabs returns; used by char guard and credit deduction.
-        incoming_char_count: int = 0
+        required_seconds = probe_video_duration_seconds(video_local_path)
 
         try:
             # ── Milestone 1: STARTED (5%) ─────────────────────────────────────────
@@ -149,7 +151,7 @@ async def run_background_job(
             logger.info(f"[pipeline] job={job_id} → STARTED")
 
             # ── Pre-flight: read subscription plan so apply_watermark is ready ─
-            # The char-guard later does its own fresh read for chars_balance.
+            # The duration firewall later does its own fresh read for seconds_balance.
             async with AsyncSessionLocal() as _pre_session:
                 _pre_user: Optional[User] = await _pre_session.get(User, uuid.UUID(user_id))
                 if not _pre_user:
@@ -298,38 +300,31 @@ async def run_background_job(
                     )
 
             # ── Character density guard ───────────────────────────────────────
-            incoming_char_count = sum(len(cue["text"]) for cue in subtitles_data)
-
             async with AsyncSessionLocal() as session:
                 user_check: Optional[User] = await session.get(User, uuid.UUID(user_id))
                 if not user_check:
                     raise RuntimeError(
-                        f"[pipeline] User {user_id} disappeared during char check — aborting job."
+                        f"[pipeline] User {user_id} disappeared during duration check — aborting job."
                     )
-                # Re-read plan in case it changed during the long ElevenLabs call,
-                # and get the freshest chars_balance for the density guard.
-                plan              = (user_check.subscription_plan or "free").lower()
-                chars_remaining: int = user_check.chars_balance or 0
-
-            tier = PROFITABLE_TIERS.get(plan, PROFITABLE_TIERS["free"])
+                plan = (user_check.subscription_plan or "free").lower()
+                seconds_remaining: int = user_check.seconds_balance or 0
 
             logger.info(
-                f"[pipeline] job={job_id} char check | "
-                f"plan={plan} | tier_limit={tier['chars_per_credit_minute']} | "
-                f"incoming={incoming_char_count} | remaining={chars_remaining}"
+                f"[pipeline] job={job_id} duration check | "
+                f"plan={plan} | required={required_seconds}s | remaining={seconds_remaining}s"
             )
 
-            if plan != "free" and incoming_char_count > chars_remaining:
-                await set_status("FAILED", progress_percentage=0, error_message=_DENSE_TEXT_ERROR)
+            if required_seconds > seconds_remaining:
+                await set_status("FAILED", progress_percentage=0, error_message=_USAGE_LIMIT_ERROR)
                 logger.warning(
-                    f"[pipeline] job={job_id} BLOCKED — DENSE_TEXT_LIMIT | "
-                    f"incoming={incoming_char_count} > remaining={chars_remaining} | plan={plan}"
+                    f"[pipeline] job={job_id} BLOCKED — CYCLE_DURATION_LIMIT | "
+                    f"required={required_seconds}s > remaining={seconds_remaining}s | plan={plan}"
                 )
                 return
 
             logger.info(
-                f"[pipeline] job={job_id} char guard PASSED "
-                f"({incoming_char_count} ≤ {chars_remaining})"
+                f"[pipeline] job={job_id} duration guard PASSED "
+                f"({required_seconds}s <= {seconds_remaining}s)"
             )
 
             # ── Milestone 4: DUBBING_COMPLETED (65%) — guard passed ──────────
@@ -356,6 +351,9 @@ async def run_background_job(
                 actual_sub_lang,
                 apply_watermark,
                 output_height,
+                output_aspect_ratio,
+                watermark_text,
+                upscale_required,
             )
 
             # ── Milestone 6: RENDERING_IN_PROGRESS (95%) — burn done, archiving
@@ -384,7 +382,7 @@ async def run_background_job(
             logger.info(f"[pipeline] job={job_id} → COMPLETED")
 
             # ── Atomic dual deduction (skipped for free plan) ─────────────────
-            if plan == "free":
+            if False and plan == "free":
                 logger.info(f"[pipeline] job={job_id} skipping credit deduction — free plan testing mode")
                 return
             # Deduct exactly 1 credit minute AND the actual transcript character
@@ -396,14 +394,18 @@ async def run_background_job(
             try:
                 async with AsyncSessionLocal() as session:
                     async with session.begin():
+                        remaining_seconds_expr = User.seconds_balance - required_seconds
                         result = await session.execute(
                             update(User)
                             .where(User.id == uuid.UUID(user_id))
-                            .where(User.credit_minutes >= 1)
-                            .where(User.chars_balance >= incoming_char_count)
+                            .where(User.seconds_balance >= required_seconds)
                             .values(
-                                credit_minutes=User.credit_minutes - 1,
-                                chars_balance=User.chars_balance - incoming_char_count,
+                                seconds_balance=remaining_seconds_expr,
+                                credit_minutes=case(
+                                    (remaining_seconds_expr <= 0, 0),
+                                    (remaining_seconds_expr < 60, 1),
+                                    else_=cast(func.floor(remaining_seconds_expr / 60), Integer),
+                                ),
                             )
                             .returning(User.id)
                         )
@@ -412,14 +414,14 @@ async def run_background_job(
                 if updated_id:
                     logger.info(
                         f"[pipeline] job={job_id} deducted → "
-                        f"1 credit minute + {incoming_char_count} chars "
+                        f"{required_seconds} seconds "
                         f"for user={user_id}"
                     )
                 else:
                     logger.warning(
                         f"[pipeline] job={job_id} deduction skipped — "
                         f"WHERE guards unmet (concurrent balance change?). "
-                        f"user={user_id} incoming_chars={incoming_char_count}"
+                        f"user={user_id} required_seconds={required_seconds}"
                     )
 
             except Exception as credit_exc:
@@ -456,6 +458,9 @@ def _burn_video(
     subtitle_lang: str = "",
     watermark: bool = False,
     output_height: int = 0,
+    output_aspect_ratio: str = "original",
+    watermark_text: str = "ReelSync AI",
+    upscale_required: bool = False,
 ) -> str:
     """Thin wrapper so asyncio.to_thread can call burn_assets positionally."""
     return engine.burn_assets(
@@ -466,6 +471,9 @@ def _burn_video(
         target_lang=subtitle_lang or target_lang,
         watermark=watermark,
         output_height=output_height,
+        output_aspect_ratio=output_aspect_ratio,
+        watermark_text=watermark_text,
+        upscale_required=upscale_required,
     )
 
 

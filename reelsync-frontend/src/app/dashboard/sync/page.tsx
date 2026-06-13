@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import axios from 'axios'
 import api from '@/utils/api'
+import { useSessionProfile } from '@/hooks/useSessionProfile'
 
 const LANGUAGES = [
   { code: 'ar',  label: 'Arabic'      },
@@ -175,6 +176,10 @@ export default function SyncPage() {
   // Voice consent modal state
   const [showConsent,    setShowConsent]    = useState(false)
   const [consentChecked, setConsentChecked] = useState(false)
+  const { profile } = useSessionProfile({
+    redirectOnUnauthorized: true,
+    onUnauthorized: () => router.replace('/login'),
+  })
 
   const isFree = plan === 'free'
 
@@ -182,11 +187,14 @@ export default function SyncPage() {
     if (!localStorage.getItem('access_token')) { router.replace('/login'); return }
     // Fetch plan — needed to gate the subtitle language selector.
     // Default stays 'free' (restrictive) if the request fails.
-    api.get<{ subscription_plan: string }>('/api/auth/me')
-      .then(res => setPlan((res.data.subscription_plan || 'free').toLowerCase()))
-      .catch(() => {})
     return () => { if (pollRef.current) clearInterval(pollRef.current) }
   }, [])
+
+  useEffect(() => {
+    if (profile?.subscription_plan) {
+      setPlan(profile.subscription_plan.toLowerCase())
+    }
+  }, [profile?.subscription_plan])
 
   // Subtitle tier gate disabled for testing
 
@@ -512,7 +520,7 @@ export default function SyncPage() {
                 </div>
                 <div>
                   <h3 className="text-sm font-semibold text-gray-800">Original Video Language</h3>
-                  <p className="text-[11px] text-gray-400">Language spoken in your source video — leave Auto for ElevenLabs to detect</p>
+                  <p className="text-[11px] text-gray-400">Language spoken in your source video — leave Auto for automatic detection</p>
                 </div>
               </div>
               <select
@@ -662,7 +670,7 @@ export default function SyncPage() {
             { key: 'PENDING',               pct: 3,   label: 'Queued',    desc: 'Waiting in the render queue…'                },
             { key: 'STARTED',               pct: 5,   label: 'Started',   desc: 'Initializing project…'                       },
             { key: 'EXTRACTED_AUDIO',       pct: 20,  label: 'Extracted', desc: 'Extracting original source audio…'            },
-            { key: 'CLONED_AUDIO',          pct: 45,  label: 'Cloned',    desc: 'Cloning speech signatures via ElevenLabs…'    },
+            { key: 'CLONED_AUDIO',          pct: 45,  label: 'Cloned',    desc: 'Cloning speech signatures…'    },
             { key: 'DUBBING_COMPLETED',     pct: 65,  label: 'Dubbed',    desc: 'Audio localization complete…'                 },
             { key: 'APPENDING_TO_VIDEO',    pct: 80,  label: 'Merging',   desc: 'Merging audio tracks & subtitles…'            },
             { key: 'RENDERING_IN_PROGRESS', pct: 95,  label: 'Rendering', desc: 'Finalizing composition render pass…'          },
@@ -683,7 +691,7 @@ export default function SyncPage() {
                 </div>
                 <div>
                   <h2 className="text-lg font-bold text-gray-800">Processing Your Video</h2>
-                  <p className="text-gray-500 text-xs mt-0.5">ElevenLabs AI dubbing — typically 2–5 minutes</p>
+                  <p className="text-gray-500 text-xs mt-0.5">AI dubbing in progress — typically 2–5 minutes</p>
                 </div>
               </div>
 
@@ -750,7 +758,9 @@ export default function SyncPage() {
               <div className="w-10 h-10 bg-green-100 rounded-full flex items-center justify-center text-green-600 font-bold text-lg">✓</div>
               <div>
                 <h2 className="text-xl font-bold text-gray-800">Dub Complete!</h2>
-                <p className="text-gray-500 text-sm">Your video is ready to preview and download.</p>
+                <p className="text-gray-500 text-sm">
+                  {isFree ? 'Your video is ready to preview.' : 'Your video is ready to preview and download.'}
+                </p>
               </div>
             </div>
 
@@ -762,13 +772,19 @@ export default function SyncPage() {
             />
 
             <div className="flex gap-3">
-              <a
-                href={videoUrl}
-                download
-                className="flex-1 text-center bg-indigo-600 hover:bg-indigo-700 text-white font-semibold py-3 rounded-xl transition-colors text-sm"
-              >
-                Download MP4
-              </a>
+              {isFree ? (
+                <div className="flex-1 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-center text-sm font-semibold text-amber-700">
+                  Free plan: preview only
+                </div>
+              ) : (
+                <a
+                  href={videoUrl}
+                  download
+                  className="flex-1 text-center bg-indigo-600 hover:bg-indigo-700 text-white font-semibold py-3 rounded-xl transition-colors text-sm"
+                >
+                  Download MP4
+                </a>
+              )}
               <button
                 onClick={resetFlow}
                 className="flex-1 bg-gray-100 hover:bg-gray-200 text-gray-700 font-semibold py-3 rounded-xl transition-colors text-sm"
