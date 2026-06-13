@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from billing import BILLING_TIERS, get_cycle_allocation, minutes_to_seconds, sync_display_minutes
+from billing import BILLING_TIERS, get_cycle_allocation, is_privileged_billing_role, minutes_to_seconds, sync_display_minutes
 from config import settings
 from database import get_db
 from models.db_models import PaymentTransaction, User
@@ -38,6 +38,21 @@ PACKAGES: dict[str, dict] = {
 
 # PhonePe path component used in the initiate-request checksum (constant for all environments)
 _PHONEPE_PAY_PATH = "/pg/v1/pay"
+
+
+async def _apply_subscription_plan(
+    *,
+    current_user: User,
+    target_plan: str,
+    db: AsyncSession,
+) -> None:
+    allocation = get_cycle_allocation(target_plan)
+    current_user.subscription_plan = target_plan.lower()
+    current_user.credit_minutes = allocation["credit_minutes"]
+    current_user.seconds_balance = allocation["seconds_balance"]
+    current_user.chars_balance = 0
+    db.add(current_user)
+    await db.commit()
 
 
 # ─── Checksum helpers ─────────────────────────────────────────────────────────
@@ -181,7 +196,7 @@ async def initiate_payment(
 
 @router.post(
     "/subscribe",
-    summary="Subscribe to a plan — FREE switches immediately; paid plans initiate PhonePe",
+    summary="Subscribe to a paid plan or use privileged bypass testing",
 )
 async def subscribe(
     body: SubscribeRequest,
@@ -189,24 +204,47 @@ async def subscribe(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    FREE plan: directly updates subscription_plan in the DB, no payment.
-    Paid plans: creates a PENDING PaymentTransaction and initiates a PhonePe
-    PAY_PAGE redirect. The package_id is stored as "sub_<PLAN>" so the webhook
-    can identify it as a subscription purchase and set subscription_plan after
-    payment completes.
+    Free is a one-time onboarding allocation and cannot be re-issued here for
+    normal users. Paid plans create a PENDING PaymentTransaction and initiate a
+    PhonePe PAY_PAGE redirect. The package_id is stored as "sub_<PLAN>" so the
+    webhook can identify it as a subscription purchase and set
+    subscription_plan after payment completes.
     """
     target_plan = body.target_plan  # uppercase, validated by schema
     tier = BILLING_TIERS[target_plan]
 
+    if is_privileged_billing_role(getattr(current_user, "role", None)):
+        await _apply_subscription_plan(
+            current_user=current_user,
+            target_plan=target_plan,
+            db=db,
+        )
+        logger.info(
+            f"[payments/subscribe] privileged user={current_user.id} "
+            f"role={getattr(current_user.role, 'value', current_user.role)} "
+            f"-> {target_plan} (direct bypass)"
+        )
+        return {
+            "status": "ok",
+            "message": f"Switched to {target_plan.title()} plan without payment.",
+            "subscription_plan": target_plan.lower(),
+            "bypass": True,
+        }
+
     # ── FREE: direct plan switch, no payment ─────────────────────────────────
     if target_plan == "FREE":
-        allocation = get_cycle_allocation("FREE")
-        current_user.subscription_plan = "free"
-        current_user.credit_minutes = allocation["credit_minutes"]
-        current_user.seconds_balance = allocation["seconds_balance"]
-        current_user.chars_balance = 0
-        db.add(current_user)
-        await db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "The Free plan is a one-time 60-second allocation. "
+                "Upgrade with PhonePe to continue."
+            ),
+        )
+        await _apply_subscription_plan(
+            current_user=current_user,
+            target_plan="FREE",
+            db=db,
+        )
         logger.info(f"[payments/subscribe] user={current_user.id} → FREE (direct)")
         return {"status": "ok", "message": "Switched to Free plan."}
 

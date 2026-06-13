@@ -41,11 +41,13 @@ Tier 2 — Diarized Voice-Cloning Pipeline  (opt-in)
 from __future__ import annotations
 
 import io
+import importlib
 import logging
 import os
 import subprocess
 import tempfile
 import time
+import warnings
 from collections import defaultdict
 from pathlib import Path
 from typing import Optional
@@ -79,16 +81,10 @@ _ELEVENLABS_SOURCE_LANGS: frozenset[str] = frozenset({
 
 # ─── optional-dependency probes ───────────────────────────────────────────────
 
-_PYANNOTE_AVAILABLE = False
 _WHISPER_AVAILABLE  = False
 _PYDUB_AVAILABLE    = False
-
-try:
-    from pyannote.audio import Pipeline as _PyAnnotePipeline   # type: ignore
-    _PYANNOTE_AVAILABLE = True
-    logger.debug("[ai_client] pyannote.audio available — Tier 2 diarization ready")
-except ImportError:
-    logger.debug("[ai_client] pyannote.audio not installed — Tier 2 unavailable")
+_PYANNOTE_PIPELINE_CLASS = None
+_PYANNOTE_IMPORT_ERROR: str | None = None
 
 try:
     from faster_whisper import WhisperModel as _WhisperModel   # type: ignore
@@ -116,12 +112,46 @@ except ImportError:
 # the operator has enabled it explicitly in the environment.
 _DIARIZATION_MODE: bool = (
     os.getenv("ELEVENLABS_DIARIZATION_MODE", "false").lower() == "true"
-    and _PYANNOTE_AVAILABLE
     and _WHISPER_AVAILABLE
     and _PYDUB_AVAILABLE
 )
 
 _HUGGINGFACE_TOKEN: str = os.getenv("HUGGINGFACE_TOKEN", "")
+
+
+def _load_pyannote_pipeline_class():
+    """
+    Import pyannote lazily so normal app startup does not trigger TorchCodec /
+    FFmpeg warnings unless the advanced diarization path is actually used.
+    """
+    global _PYANNOTE_PIPELINE_CLASS, _PYANNOTE_IMPORT_ERROR
+
+    if _PYANNOTE_PIPELINE_CLASS is not None:
+        return _PYANNOTE_PIPELINE_CLASS
+
+    if _PYANNOTE_IMPORT_ERROR is not None:
+        raise RuntimeError(_PYANNOTE_IMPORT_ERROR)
+
+    try:
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="torchcodec is not installed correctly so built-in audio decoding will fail.*",
+                category=UserWarning,
+            )
+            pyannote_audio = importlib.import_module("pyannote.audio")
+        _PYANNOTE_PIPELINE_CLASS = pyannote_audio.Pipeline
+        logger.debug("[ai_client] pyannote.audio available — Tier 2 diarization ready")
+        return _PYANNOTE_PIPELINE_CLASS
+    except Exception as exc:
+        _PYANNOTE_IMPORT_ERROR = (
+            "pyannote.audio could not be loaded for diarization mode. "
+            "Install a compatible TorchCodec/FFmpeg/PyTorch stack or disable "
+            "ELEVENLABS_DIARIZATION_MODE. "
+            f"Original error: {exc}"
+        )
+        logger.warning("[ai_client] %s", _PYANNOTE_IMPORT_ERROR)
+        raise RuntimeError(_PYANNOTE_IMPORT_ERROR) from exc
 
 
 # ─── Tier 1: ElevenLabs Dubbing API ──────────────────────────────────────────
@@ -338,8 +368,9 @@ class DiarizedVoiceOrchestrator:
                 raise RuntimeError(
                     "HUGGINGFACE_TOKEN is not set in .env — required for pyannote model access."
                 )
+            pyannote_pipeline_class = _load_pyannote_pipeline_class()
             logger.info("[Tier 2] Loading PyAnnote diarization model (first-time download may be slow)…")
-            self._diarize_pipeline = _PyAnnotePipeline.from_pretrained(
+            self._diarize_pipeline = pyannote_pipeline_class.from_pretrained(
                 "pyannote/speaker-diarization-3.1",
                 use_auth_token=_HUGGINGFACE_TOKEN,
             )

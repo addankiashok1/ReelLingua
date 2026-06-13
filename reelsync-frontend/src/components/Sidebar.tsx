@@ -1,19 +1,9 @@
 'use client'
 
-import Link from 'next/link'
 import { usePathname, useRouter } from 'next/navigation'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import api from '@/utils/api'
-
-const CHARS_PER_MINUTE = 750
-
-interface UserProfile {
-  email: string
-  credit_minutes: number
-  credit_limit_minutes: number
-  subscription_plan: string
-  profile_picture_url: string | null
-}
+import { useSessionProfile } from '@/hooks/useSessionProfile'
 
 interface SidebarProps {
   collapsed: boolean
@@ -101,37 +91,68 @@ function getDisplayName(email: string | undefined): string {
   return cleaned || local
 }
 
+function formatRoleLabel(role: string | undefined): string {
+  const value = (role ?? 'USER').toUpperCase()
+  if (value === 'ROOT') return 'ROOT Access'
+  if (value === 'ADMIN') return 'Admin Access'
+  return 'User Access'
+}
+
+function isPrivilegedRole(role: string | undefined): boolean {
+  const value = (role ?? '').toUpperCase()
+  return value === 'ROOT' || value === 'ADMIN'
+}
+
+function formatPlanCredits(value: number): string {
+  if (value >= 1000) {
+    const formatted = value % 1000 === 0 ? `${value / 1000}` : `${(value / 1000).toFixed(1)}`
+    return `${formatted.replace(/\.0$/, '')}k`
+  }
+  return `${value}`
+}
+
+function formatSecondsLabel(value: number): string {
+  return `${Math.max(0, value)} sec`
+}
+
 function SidebarLink({
-  href,
   label,
   active,
   collapsed,
+  disabled = false,
+  onClick,
   title,
   children,
   trailing,
 }: {
-  href: string
   label: string
   active: boolean
   collapsed: boolean
+  disabled?: boolean
+  onClick?: () => void
   title?: string
   children: React.ReactNode
   trailing?: React.ReactNode
 }) {
+  const className = `flex items-center rounded-xl text-sm font-medium transition-all ${
+    disabled
+      ? 'cursor-not-allowed text-slate-600 hover:bg-slate-900 hover:text-slate-500'
+      : active
+        ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-900/30'
+        : 'text-slate-400 hover:bg-slate-800 hover:text-white'
+  } ${collapsed ? 'justify-center px-2 py-3' : 'gap-3 px-3 py-2.5'}`
+
   return (
-    <Link
-      href={href}
+    <button
+      type="button"
+      onClick={onClick}
       title={collapsed ? (title ?? label) : undefined}
-      className={`flex items-center rounded-xl text-sm font-medium transition-all ${
-        active
-          ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-900/30'
-          : 'text-slate-400 hover:bg-slate-800 hover:text-white'
-      } ${collapsed ? 'justify-center px-2 py-3' : 'gap-3 px-3 py-2.5'}`}
+      className={className}
     >
       {children}
       {!collapsed && <span className="flex-1">{label}</span>}
       {!collapsed && trailing}
-    </Link>
+    </button>
   )
 }
 
@@ -140,20 +161,17 @@ export default function Sidebar({ collapsed, onToggle }: SidebarProps) {
   const router = useRouter()
   const profileWrapperRef = useRef<HTMLDivElement | null>(null)
   const [trashCount, setTrashCount] = useState(0)
-  const [profile, setProfile] = useState<UserProfile | null>(null)
   const [isProfileDropdownOpen, setIsProfileDropdownOpen] = useState(false)
+  const { profile, refreshProfile } = useSessionProfile({
+    redirectOnUnauthorized: true,
+    onUnauthorized: () => router.replace('/login'),
+  })
 
   useEffect(() => {
     api.get<{ count: number }>('/api/trash/count')
       .then(res => setTrashCount(res.data.count ?? 0))
       .catch(() => {})
   }, [pathname])
-
-  useEffect(() => {
-    api.get<UserProfile>('/api/auth/me')
-      .then(res => setProfile(res.data))
-      .catch(() => {})
-  }, [])
 
   useEffect(() => {
     function handleDocumentMouseDown(event: MouseEvent) {
@@ -172,15 +190,25 @@ export default function Sidebar({ collapsed, onToggle }: SidebarProps) {
     setIsProfileDropdownOpen(false)
   }, [collapsed, pathname])
 
-  const credits = profile?.credit_minutes ?? 0
-  const maxMin = profile?.credit_limit_minutes ?? 2
-  const totalChars = maxMin * CHARS_PER_MINUTE
-  const availChars = credits * CHARS_PER_MINUTE
-  const charPct = totalChars > 0 ? Math.min(100, Math.round((availChars / totalChars) * 100)) : 0
-  const videoPct = maxMin > 0 ? Math.min(100, Math.round((credits / maxMin) * 100)) : 0
+  useEffect(() => {
+    void refreshProfile().catch(() => {})
+  }, [pathname, refreshProfile])
+
   const planLabel = profile?.subscription_plan
     ? `${profile.subscription_plan.charAt(0).toUpperCase()}${profile.subscription_plan.slice(1)}`
     : 'Free'
+  const roleLabel = formatRoleLabel(profile?.role)
+  const hasPrivilegedAccess = isPrivilegedRole(profile?.role)
+  const hasWorkspaceAccess = hasPrivilegedAccess || (profile?.subscription_plan ?? 'free').toLowerCase() !== 'free'
+  const isFreePlan = (profile?.subscription_plan ?? 'free').toLowerCase() === 'free'
+  const remainingPlanCredits = profile?.credit_balance_credits ?? 0
+  const planCreditTotal = profile?.credit_limit_credits ?? 0
+  const remainingPct = planCreditTotal > 0 ? Math.min(100, Math.round((remainingPlanCredits / planCreditTotal) * 100)) : 0
+  const usedPlanCredits = Math.max(planCreditTotal - remainingPlanCredits, 0)
+  const remainingPlanSeconds = profile?.credit_seconds ?? 0
+  const planSecondsTotal = profile?.credit_limit_seconds ?? 60
+  const remainingSecondsPct = planSecondsTotal > 0 ? Math.min(100, Math.round((remainingPlanSeconds / planSecondsTotal) * 100)) : 0
+  const usedPlanSeconds = Math.max(planSecondsTotal - remainingPlanSeconds, 0)
   const displayName = useMemo(() => getDisplayName(profile?.email), [profile?.email])
   const avatarSrc = profile?.profile_picture_url
     ? `http://localhost:8000${profile.profile_picture_url}`
@@ -224,10 +252,22 @@ export default function Sidebar({ collapsed, onToggle }: SidebarProps) {
         {NAV_ITEMS.map(item => (
           <SidebarLink
             key={item.href}
-            href={item.href}
             label={item.label}
             active={isActive(item.href, item.exact)}
             collapsed={collapsed}
+            disabled={item.href === '/dashboard/projects' && !hasWorkspaceAccess}
+            onClick={() => {
+              if (item.href === '/dashboard/projects' && !hasWorkspaceAccess) {
+                router.push('/dashboard/billing?restricted=projects')
+                return
+              }
+              router.push(item.href)
+            }}
+            title={
+              item.href === '/dashboard/projects' && !hasWorkspaceAccess
+                ? 'Upgrade to Starter or above to access Projects'
+                : undefined
+            }
           >
             {item.icon}
           </SidebarLink>
@@ -236,42 +276,56 @@ export default function Sidebar({ collapsed, onToggle }: SidebarProps) {
 
       {!collapsed && (
         <div className="border-t border-slate-800/60 px-3 pb-5 pt-4">
-          <p className="mb-3 px-3 text-[10px] font-bold uppercase tracking-wider text-slate-500">Usage & Limits</p>
+          <p className="mb-3 px-3 text-[10px] font-bold uppercase tracking-wider text-slate-500">
+            {isFreePlan ? 'Usage & Plan' : 'Credits & Plan'}
+          </p>
 
           <div className="space-y-4 px-1">
             <div className="space-y-2">
               <div className="flex items-center gap-2 text-[11px] text-slate-300">
                 <svg className="h-4 w-4 flex-shrink-0 text-slate-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M9 19V6l12-3v13M9 19c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zm12-3c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zM9 10l12-3" />
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M12 8c-2.21 0-4 1.79-4 4m4-4c2.21 0 4 1.79 4 4m-4-4V4m0 8v8m0 0H8m4 0h4" />
                 </svg>
-                <span className="font-medium text-slate-200">Audio: {availChars.toLocaleString()} / {totalChars.toLocaleString()} chars</span>
+                <span className="font-medium text-slate-200">
+                  {isFreePlan
+                    ? `Seconds left: ${formatSecondsLabel(remainingPlanSeconds)} / ${formatSecondsLabel(planSecondsTotal)}`
+                    : `Credits: ${formatPlanCredits(remainingPlanCredits)} / ${formatPlanCredits(planCreditTotal)}`}
+                </span>
               </div>
               <div className="h-1.5 w-full overflow-hidden rounded-full bg-slate-800">
-                <div className="h-full rounded-full bg-red-500/80 transition-all duration-300" style={{ width: `${charPct}%` }} />
+                <div
+                  className="h-full rounded-full bg-indigo-500 transition-all duration-300"
+                  style={{ width: `${isFreePlan ? remainingSecondsPct : remainingPct}%` }}
+                />
               </div>
-            </div>
-
-            <div className="space-y-2">
-              <div className="flex items-center gap-2 text-[11px] text-slate-300">
-                <svg className="h-4 w-4 flex-shrink-0 text-slate-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M12 6v6l4 2m-8 6a9 9 0 100-18 9 9 0 000 18z" />
-                </svg>
-                <span className="font-medium text-slate-200">Video: {credits} / {maxMin} min</span>
-              </div>
-              <div className="h-1.5 w-full overflow-hidden rounded-full bg-slate-800">
-                <div className="h-full rounded-full bg-slate-700 transition-all duration-300" style={{ width: `${videoPct}%` }} />
-              </div>
+              <p className="text-[11px] text-slate-500">
+                {isFreePlan
+                  ? `${formatSecondsLabel(usedPlanSeconds)} used from your one-time free limit`
+                  : `${formatPlanCredits(usedPlanCredits)} credits used this cycle`}
+              </p>
             </div>
 
             <div className="rounded-2xl border border-slate-800 bg-slate-900/90 px-3 py-3">
-              <div className="flex items-center justify-between gap-3">
+              <div className="flex items-start justify-between gap-3">
                 <div>
-                  <p className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">Your Plan</p>
-                  <p className="mt-1 text-sm font-semibold text-white">Plan: {planLabel}</p>
+                  <p className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
+                    {hasPrivilegedAccess ? 'Access & Plan' : 'Your Plan'}
+                  </p>
+                  {hasPrivilegedAccess && (
+                    <p className="mt-1 text-xs font-semibold text-emerald-300">{roleLabel}</p>
+                  )}
+                  <p className="mt-1 text-sm font-semibold text-white">{planLabel}</p>
+                  {hasPrivilegedAccess && (
+                    <p className="mt-1 text-[11px] text-slate-500">Billing plan stays separate from privileged access.</p>
+                  )}
                 </div>
-                <Link href="/dashboard/billing" className="text-[11px] font-semibold text-purple-400 transition hover:text-purple-300">
-                  Upgrade
-                </Link>
+                <button
+                  type="button"
+                  onClick={() => router.push('/dashboard/billing')}
+                  className="text-[11px] font-semibold text-indigo-400 transition hover:text-indigo-300"
+                >
+                  Manage
+                </button>
               </div>
             </div>
           </div>
@@ -281,11 +335,11 @@ export default function Sidebar({ collapsed, onToggle }: SidebarProps) {
       <div className={`border-t border-slate-800/60 pt-3 ${collapsed ? 'px-2 pb-4' : 'px-3 pb-5'}`}>
         <div className="space-y-1">
           <SidebarLink
-            href="/dashboard/trash"
             label="Trash"
             title="Trash"
             active={pathname.startsWith('/dashboard/trash')}
             collapsed={collapsed}
+            onClick={() => router.push('/dashboard/trash')}
             trailing={
               trashCount > 0 ? (
                 <span className="rounded-full bg-slate-700 px-1.5 py-0.5 text-[10px] font-bold leading-none text-slate-300">
@@ -341,13 +395,17 @@ export default function Sidebar({ collapsed, onToggle }: SidebarProps) {
                 {profile?.email ?? 'Loading account...'}
               </div>
 
-              <Link
-                href="/dashboard/profile"
+              <button
+                type="button"
+                onClick={() => {
+                  setIsProfileDropdownOpen(false)
+                  router.push('/dashboard/profile')
+                }}
                 className="flex items-center gap-2 rounded-lg px-3 py-2 text-xs text-slate-200 transition-colors hover:bg-slate-800"
               >
                 <ProfileIcon className="h-4 w-4 text-slate-400" />
                 Profile Settings
-              </Link>
+              </button>
 
               <button
                 type="button"

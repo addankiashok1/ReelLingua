@@ -1,63 +1,43 @@
 'use client'
 
-import { Suspense, useEffect, useMemo, useState } from 'react'
+import { Suspense, useEffect, useState } from 'react'
 import { useRouter, useSearchParams } from 'next/navigation'
 import axios from 'axios'
 import api from '@/utils/api'
+import { broadcastProfileRefresh, useSessionProfile } from '@/hooks/useSessionProfile'
 
 interface UserProfile {
   user_id: string
   email: string
+  role?: string
   credit_minutes: number
+  credit_seconds?: number
+  credit_balance_credits?: number
   subscription_plan: string
   credit_limit_minutes: number
-}
-
-interface TierUsage {
-  user_id: string
-  subscription_plan: string
-  tier_label: string
-  chars_per_credit?: number
-  chars_balance?: number
-  credit_minutes?: number
-  chars_total_grant?: number
-  chars_utilization_pct?: number
+  credit_limit_seconds?: number
+  credit_limit_credits?: number
+  advertised_credits?: number
+  protected_credit_ratio?: number
 }
 
 type PlanId = 'FREE' | 'STARTER' | 'CREATOR' | 'PRO'
-type PackId = 'starter' | 'creator'
 
 interface Tier {
   id: PlanId
   label: string
   badge: string | null
   priceDisplay: string
-  basePrice: number
-  gstAmount: number
-  handlingFee: number
-  totalPerMonth: number
-  minLimit: number
-  charLimit: number
+  minutesDisplay: string
+  creditsDisplay: string
   quality: string
   allowDownload: boolean
   watermark: boolean
   crossSubtitles: boolean
   voiceCloning: boolean
-  providerPriceUsd: number
-  providerCharsIncluded: number
   accentClass: string
-  surfaceClass: string
   buttonClass: string
-}
-
-interface CreditPack {
-  id: PackId
-  label: string
-  credits: number
-  priceDisplay: string
-  amountInr: number
-  accentClass: string
-  description: string
+  cycleCreditsFallback: number
 }
 
 const TIERS: Tier[] = [
@@ -66,120 +46,74 @@ const TIERS: Tier[] = [
     label: 'Free',
     badge: null,
     priceDisplay: 'Rs 0',
-    basePrice: 0,
-    gstAmount: 0,
-    handlingFee: 0,
-    totalPerMonth: 0,
-    minLimit: 13,
-    charLimit: 9_750,
-    quality: '720p',
+    minutesDisplay: '1 min /mo',
+    creditsDisplay: '',
+    quality: 'Up to 420p',
     allowDownload: false,
     watermark: true,
     crossSubtitles: false,
     voiceCloning: true,
-    providerPriceUsd: 0,
-    providerCharsIncluded: 10_000,
     accentClass: 'text-slate-200',
-    surfaceClass: 'border-slate-800 bg-slate-950/85',
     buttonClass: 'bg-slate-800 text-slate-100 hover:bg-slate-700',
+    cycleCreditsFallback: 7_000,
   },
   {
     id: 'STARTER',
     label: 'Starter',
     badge: null,
-    priceDisplay: 'Rs 599',
-    basePrice: 599,
-    gstAmount: 107.82,
-    handlingFee: 0,
-    totalPerMonth: 706.82,
-    minLimit: 80,
-    charLimit: 60_000,
-    quality: '1080p',
+    priceDisplay: 'Rs 699',
+    minutesDisplay: '21 min /mo',
+    creditsDisplay: '21k credits /mo',
+    quality: 'Up to 1080p',
     allowDownload: true,
     watermark: false,
     crossSubtitles: true,
     voiceCloning: true,
-    providerPriceUsd: 6,
-    providerCharsIncluded: 60_000,
     accentClass: 'text-indigo-300',
-    surfaceClass: 'border-indigo-900/70 bg-indigo-950/25',
     buttonClass: 'bg-indigo-600 text-white hover:bg-indigo-500',
+    cycleCreditsFallback: 21_000,
   },
   {
     id: 'CREATOR',
     label: 'Creator',
     badge: 'Recommended',
-    priceDisplay: 'Rs 2,099',
-    basePrice: 2_099,
-    gstAmount: 377.82,
-    handlingFee: 0,
-    totalPerMonth: 2_476.82,
-    minLimit: 293,
-    charLimit: 219_750,
-    quality: '4K',
+    priceDisplay: 'Rs 2,199',
+    minutesDisplay: '84.7 min /mo',
+    creditsDisplay: '84.7k credits /mo',
+    quality: 'Up to 2160p',
     allowDownload: true,
     watermark: false,
     crossSubtitles: true,
     voiceCloning: true,
-    providerPriceUsd: 22,
-    providerCharsIncluded: 220_000,
     accentClass: 'text-fuchsia-300',
-    surfaceClass: 'border-fuchsia-900/70 bg-fuchsia-950/20',
     buttonClass: 'bg-fuchsia-600 text-white hover:bg-fuchsia-500',
+    cycleCreditsFallback: 84_700,
   },
   {
     id: 'PRO',
     label: 'Pro',
     badge: null,
-    priceDisplay: 'Rs 9,499',
-    basePrice: 9_499,
-    gstAmount: 1_709.82,
-    handlingFee: 0,
-    totalPerMonth: 11_208.82,
-    minLimit: 1_320,
-    charLimit: 990_000,
-    quality: '4K',
+    priceDisplay: 'Rs 9,999',
+    minutesDisplay: '420 min /mo',
+    creditsDisplay: '420k credits /mo',
+    quality: 'Up to 2160p',
     allowDownload: true,
     watermark: false,
     crossSubtitles: true,
     voiceCloning: true,
-    providerPriceUsd: 99,
-    providerCharsIncluded: 990_000,
     accentClass: 'text-amber-300',
-    surfaceClass: 'border-amber-900/70 bg-amber-950/20',
     buttonClass: 'bg-amber-500 text-slate-950 hover:bg-amber-400',
-  },
-]
-
-const CREDIT_PACKS: CreditPack[] = [
-  {
-    id: 'starter',
-    label: 'Starter Pack',
-    credits: 30,
-    priceDisplay: 'Rs 299',
-    amountInr: 299,
-    accentClass: 'text-emerald-300',
-    description: 'Best for short bursts of dubbing when your monthly pool runs low.',
-  },
-  {
-    id: 'creator',
-    label: 'Creator Pack',
-    credits: 120,
-    priceDisplay: 'Rs 999',
-    amountInr: 999,
-    accentClass: 'text-cyan-300',
-    description: 'Ideal for active creators who need extra renders without switching plans.',
+    cycleCreditsFallback: 420_000,
   },
 ]
 
 const TIER_ORDER: PlanId[] = ['FREE', 'STARTER', 'CREATOR', 'PRO']
 
 const FEATURE_ROWS: { label: string; getValue: (tier: Tier) => string | boolean }[] = [
-  { label: 'Processing minutes / month', getValue: tier => `${tier.minLimit.toLocaleString()} min` },
-  { label: 'Transcript capacity / month', getValue: tier => `${tier.charLimit.toLocaleString()} chars` },
-  { label: 'Underlying base plan', getValue: tier => tier.providerPriceUsd > 0 ? `$${tier.providerPriceUsd}/mo` : 'Free' },
-  { label: 'Included monthly chars', getValue: tier => tier.providerCharsIncluded.toLocaleString() },
+  { label: 'Minutes / month', getValue: tier => tier.minutesDisplay },
+  { label: 'Credits / month', getValue: tier => tier.creditsDisplay },
   { label: 'Output quality', getValue: tier => tier.quality },
+  { label: 'Project access', getValue: tier => tier.id !== 'FREE' },
   { label: 'Video download', getValue: tier => tier.allowDownload },
   { label: 'No watermark', getValue: tier => !tier.watermark },
   { label: 'Cross-language subtitles', getValue: tier => tier.crossSubtitles },
@@ -191,11 +125,28 @@ function formatPlan(plan: string | undefined): string {
   return value.charAt(0).toUpperCase() + value.slice(1)
 }
 
-function formatCurrency(amount: number): string {
-  return `Rs ${amount.toLocaleString('en-IN', {
-    minimumFractionDigits: amount % 1 === 0 ? 0 : 2,
-    maximumFractionDigits: 2,
-  })}`
+function formatCreditCount(value: number): string {
+  if (value >= 1000) {
+    const compact = value % 1000 === 0 ? `${value / 1000}` : `${(value / 1000).toFixed(1)}`
+    return `${compact.replace(/\.0$/, '')}k`
+  }
+  return `${value}`
+}
+
+function formatSecondsLabel(value: number): string {
+  return `${Math.max(0, value)} sec`
+}
+
+function formatRole(role: string | undefined): string {
+  const value = (role ?? 'USER').toUpperCase()
+  if (value === 'ROOT') return 'ROOT'
+  if (value === 'ADMIN') return 'ADMIN'
+  return 'USER'
+}
+
+function isPrivilegedRole(role: string | undefined): boolean {
+  const value = (role ?? '').toUpperCase()
+  return value === 'ROOT' || value === 'ADMIN'
 }
 
 function StatCard({
@@ -269,7 +220,7 @@ function PurchaseOverlay() {
         </div>
         <p className="mt-5 text-lg font-semibold text-white">Opening secure payment</p>
         <p className="mt-2 text-sm leading-6 text-slate-400">
-          Redirecting you to PhonePe to confirm your plan or top-up purchase.
+          Redirecting you to PhonePe to confirm your plan purchase.
         </p>
       </div>
     </div>
@@ -280,15 +231,20 @@ function BillingContent() {
   const router = useRouter()
   const searchParams = useSearchParams()
 
-  const [profile, setProfile] = useState<UserProfile | null>(null)
-  const [tierUsage, setTierUsage] = useState<TierUsage | null>(null)
-  const [loading, setLoading] = useState(true)
   const [purchasing, setPurchasing] = useState(false)
   const [switchingFree, setSwitchingFree] = useState(false)
   const [activePlan, setActivePlan] = useState<PlanId | null>(null)
-  const [activePack, setActivePack] = useState<PackId | null>(null)
   const [error, setError] = useState('')
   const [successMsg, setSuccessMsg] = useState('')
+  const {
+    profile,
+    setProfile,
+    loading,
+    refreshProfile,
+  } = useSessionProfile<UserProfile>({
+    redirectOnUnauthorized: true,
+    onUnauthorized: () => router.replace('/login'),
+  })
 
   const returnTxn = searchParams.get('txn')
   const returnStatus = searchParams.get('status')
@@ -297,36 +253,12 @@ function BillingContent() {
     const token = localStorage.getItem('access_token')
     if (!token) {
       router.replace('/login')
-      return
     }
-
-    void fetchBillingState()
   }, [router])
-
-  const fetchBillingState = async () => {
-    try {
-      const [profileRes, tierRes] = await Promise.all([
-        api.get<UserProfile>('/api/auth/me'),
-        api.get<TierUsage>('/api/videos/tier'),
-      ])
-      setProfile(profileRes.data)
-      setTierUsage(tierRes.data)
-    } catch (err) {
-      if (axios.isAxiosError(err) && err.response?.status === 401) {
-        localStorage.clear()
-        router.replace('/login')
-      } else {
-        setError('Could not load your billing profile right now.')
-      }
-    } finally {
-      setLoading(false)
-    }
-  }
 
   const handleSubscribe = async (planId: PlanId) => {
     setError('')
     setSuccessMsg('')
-    setActivePack(null)
     setActivePlan(planId)
 
     if (planId === 'FREE') {
@@ -334,7 +266,11 @@ function BillingContent() {
       try {
         await api.post('/api/payments/subscribe', { target_plan: 'FREE' })
         setSuccessMsg('Switched to the Free plan successfully.')
-        await fetchBillingState()
+        const nextProfile = await refreshProfile()
+        if (nextProfile) {
+          setProfile(nextProfile)
+        }
+        broadcastProfileRefresh()
       } catch (err) {
         if (axios.isAxiosError(err)) {
           setError(err.response?.data?.detail || 'Could not switch plans right now.')
@@ -350,68 +286,62 @@ function BillingContent() {
 
     setPurchasing(true)
     try {
-      const { data } = await api.post<{ payment_url: string; merchant_txn_id: string }>(
+      const { data } = await api.post<{
+        payment_url?: string
+        merchant_txn_id?: string
+        status?: string
+        message?: string
+        subscription_plan?: string
+        bypass?: boolean
+      }>(
         '/api/payments/subscribe',
         { target_plan: planId },
       )
-      window.location.href = data.payment_url
+      if (data.payment_url) {
+        window.location.href = data.payment_url
+        return
+      }
+
+      if (data.status === 'ok') {
+        setSuccessMsg(data.message || `Switched to the ${planId} plan successfully.`)
+        const nextProfile = await refreshProfile()
+        if (nextProfile) {
+          setProfile(nextProfile)
+        }
+        broadcastProfileRefresh()
+        return
+      }
+
+      throw new Error('Unexpected subscription response.')
     } catch (err) {
-      setPurchasing(false)
-      setActivePlan(null)
       if (axios.isAxiosError(err)) {
         setError(err.response?.data?.detail || 'Could not start the plan purchase.')
       } else {
         setError('Could not start the plan purchase.')
       }
-    }
-  }
-
-  const handleTopUp = async (packId: PackId) => {
-    setError('')
-    setSuccessMsg('')
-    setActivePlan(null)
-    setActivePack(packId)
-    setPurchasing(true)
-
-    try {
-      const { data } = await api.post<{ payment_url: string; merchant_txn_id: string }>(
-        '/api/payments/initiate',
-        { package_id: packId },
-      )
-      window.location.href = data.payment_url
-    } catch (err) {
+    } finally {
       setPurchasing(false)
-      setActivePack(null)
-      if (axios.isAxiosError(err)) {
-        setError(err.response?.data?.detail || 'Could not start the credit top-up.')
-      } else {
-        setError('Could not start the credit top-up.')
-      }
+      setActivePlan(null)
     }
   }
 
   const currentPlan = ((profile?.subscription_plan ?? 'free').toUpperCase()) as PlanId
   const currentTier = TIERS.find(tier => tier.id === currentPlan) ?? TIERS[0]
   const currentPlanIndex = TIER_ORDER.indexOf(currentPlan)
-  const credits = profile?.credit_minutes ?? 0
-  const maxMinutes = profile?.credit_limit_minutes ?? currentTier.minLimit
-  const charsBalance = tierUsage?.chars_balance ?? credits * 750
-  const charsTotalGrant = tierUsage?.chars_total_grant ?? maxMinutes * 750
-  const charsPerCredit = tierUsage?.chars_per_credit ?? 750
-  const usedMinutes = Math.max(maxMinutes - credits, 0)
-  const minuteUsagePct = maxMinutes > 0 ? Math.min(100, Math.round((usedMinutes / maxMinutes) * 100)) : 0
-  const charUsagePct = Math.max(0, Math.min(100, Math.round(tierUsage?.chars_utilization_pct ?? 0)))
+  const currentRole = formatRole(profile?.role)
+  const hasPrivilegedAccess = isPrivilegedRole(profile?.role)
+  const isFreePlan = currentPlan === 'FREE'
+  const minutesLeft = profile?.credit_minutes ?? 0
+  const minuteLimit = profile?.credit_limit_minutes ?? 0
+  const usedMinutes = Math.max(minuteLimit - minutesLeft, 0)
+  const secondsLeft = profile?.credit_seconds ?? 0
+  const secondLimit = profile?.credit_limit_seconds ?? 60
+  const usedSeconds = Math.max(secondLimit - secondsLeft, 0)
+  const credits = profile?.credit_balance_credits ?? 0
+  const maxCredits = profile?.credit_limit_credits ?? currentTier.cycleCreditsFallback
+  const minutesUsagePct = minuteLimit > 0 ? Math.min(100, Math.round((usedMinutes / minuteLimit) * 100)) : 0
+  const secondsUsagePct = secondLimit > 0 ? Math.min(100, Math.round((usedSeconds / secondLimit) * 100)) : 0
   const watermarkLabel = currentTier.watermark ? 'Watermark enabled' : 'Watermark removed'
-
-  const featurePills = useMemo(
-    () => [
-      `${currentTier.quality} output`,
-      currentTier.allowDownload ? 'Downloads enabled' : 'Downloads locked',
-      currentTier.crossSubtitles ? 'Cross subtitles included' : 'Single-language subtitles',
-      currentTier.voiceCloning ? 'Voice cloning included' : 'Voice cloning locked',
-    ],
-    [currentTier],
-  )
 
   if (loading) {
     return (
@@ -434,7 +364,7 @@ function BillingContent() {
             <p className="font-semibold">Payment received, activation in progress</p>
             <p className="mt-1 text-amber-200/80">
               Your PhonePe transaction is being confirmed. Credits usually refresh within a few seconds.
-              <button onClick={() => void fetchBillingState()} className="ml-2 font-semibold text-amber-100 underline underline-offset-4">
+              <button onClick={() => void refreshProfile()} className="ml-2 font-semibold text-amber-100 underline underline-offset-4">
                 Refresh now
               </button>
             </p>
@@ -453,240 +383,136 @@ function BillingContent() {
           </div>
         )}
 
-        <section className="overflow-hidden rounded-[28px] border border-slate-800 bg-[radial-gradient(circle_at_top_left,_rgba(99,102,241,0.18),_transparent_35%),radial-gradient(circle_at_top_right,_rgba(14,165,233,0.14),_transparent_30%),linear-gradient(180deg,_rgba(15,23,42,0.98),_rgba(2,6,23,0.98))]">
-          <div className="grid gap-8 px-6 py-7 lg:grid-cols-[1.4fr_1fr] lg:px-8">
+        <section className="rounded-[28px] border border-slate-800 bg-slate-950/90 p-6">
+          <div className="flex flex-wrap items-end justify-between gap-4">
             <div>
-              <p className="text-xs font-semibold uppercase tracking-[0.3em] text-indigo-300/80">Billing & Credits</p>
-              <h1 className="mt-3 text-3xl font-bold tracking-tight text-white">Manage ReelSync rendering capacity</h1>
-              <p className="mt-3 max-w-2xl text-sm leading-6 text-slate-300">
-                Your plan controls monthly render minutes, transcript character allowance, export quality, and feature access.
-                One completed dub consumes 1 credit minute. Character balance keeps transcript-heavy jobs within the correct tier.
-              </p>
-              <p className="mt-3 max-w-2xl text-xs leading-6 text-slate-500">
-                Updated against current upstream plan pricing and limits on June 10, 2026.
-                ReelSync packages those cost bands into INR pricing for this dubbing workflow.
-              </p>
-
-              <div className="mt-5 flex flex-wrap gap-2">
-                {featurePills.map(item => (
-                  <span key={item} className="rounded-full border border-slate-700 bg-slate-900/80 px-3 py-1.5 text-xs font-medium text-slate-200">
-                    {item}
-                  </span>
-                ))}
-              </div>
-
-              <div className="mt-7 grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-                <StatCard
-                  label="Current plan"
-                  value={formatPlan(profile?.subscription_plan)}
-                  helper={`${watermarkLabel} · current usage tier`}
-                />
-                <StatCard
-                  label="Minutes left"
-                  value={`${credits} min`}
-                  helper={`${usedMinutes} of ${maxMinutes} used this cycle`}
-                />
-                <StatCard
-                  label="Transcript balance"
-                  value={charsBalance.toLocaleString()}
-                  helper={`${charsPerCredit.toLocaleString()} chars available per credit minute`}
-                />
-                <StatCard
-                  label="PhonePe billing"
-                  value="Secure"
-                  helper="Plans and top-ups both redirect through PhonePe checkout"
-                />
-              </div>
+              <p className="text-xs font-semibold uppercase tracking-[0.3em] text-slate-500">Monthly plans</p>
+              <h2 className="mt-2 text-2xl font-semibold text-white">Plan-by-plan comparison</h2>
+              {hasPrivilegedAccess && (
+                <p className="mt-3 inline-flex items-center rounded-full border border-fuchsia-500/30 bg-fuchsia-500/10 px-3 py-1 text-xs font-semibold text-fuchsia-200">
+                  {currentRole} access enabled for this account. Billing plan remains {formatPlan(profile?.subscription_plan)}.
+                </p>
+              )}
             </div>
+            <p className="max-w-md text-sm leading-6 text-slate-400">
+              One clean comparison table for every plan, with the same purchase buttons kept directly in the plan columns.
+            </p>
+          </div>
 
+          <div className="mt-6 overflow-x-auto">
+            <table className="min-w-full border-separate border-spacing-0 overflow-hidden rounded-3xl border border-slate-800">
+              <thead>
+                <tr className="bg-slate-900 align-top">
+                  <th className="border-b border-slate-800 px-5 py-5 text-left text-xs font-semibold uppercase tracking-[0.22em] text-slate-500">
+                    Feature
+                  </th>
+                  {TIERS.map(tier => {
+                    const isCurrent = tier.id === currentPlan
+                    const tierIndex = TIER_ORDER.indexOf(tier.id)
+                    const isUpgrade = tierIndex > currentPlanIndex
+                    const anyBusy = purchasing || switchingFree
+                    const isActive = activePlan === tier.id
+                    const isDisabled = anyBusy || isCurrent
+
+                    let buttonLabel = 'Switch plan'
+                    if (isCurrent) buttonLabel = 'Current plan'
+                    else if (tier.id === 'FREE') buttonLabel = switchingFree && isActive ? 'Switching...' : 'Switch to Free'
+                    else if (isUpgrade) buttonLabel = purchasing && isActive ? 'Connecting...' : 'Upgrade plan'
+                    else buttonLabel = purchasing && isActive ? 'Connecting...' : 'Move to this plan'
+
+                    return (
+                      <th
+                        key={tier.id}
+                        className={`border-b border-slate-800 px-4 py-5 text-center ${isCurrent ? 'bg-emerald-950/20' : ''}`}
+                      >
+                        <div className="mx-auto flex max-w-[180px] flex-col items-center">
+                          <div className="flex min-h-[46px] flex-col items-center justify-center">
+                            <span className={`text-sm font-semibold ${tier.accentClass}`}>{tier.label}</span>
+                            {isCurrent ? (
+                              <span className="mt-1 rounded-full bg-emerald-500/15 px-2.5 py-1 text-[9px] font-bold uppercase tracking-[0.2em] text-emerald-300">
+                                Active
+                              </span>
+                            ) : tier.badge ? (
+                              <span className="mt-1 rounded-full border border-fuchsia-500/25 bg-fuchsia-500/10 px-2.5 py-1 text-[9px] font-bold uppercase tracking-[0.2em] text-fuchsia-200">
+                                {tier.badge}
+                              </span>
+                            ) : null}
+                          </div>
+                          <p className="mt-3 text-2xl font-bold text-white">{tier.priceDisplay}</p>
+                          <button
+                            type="button"
+                            onClick={() => void handleSubscribe(tier.id)}
+                            disabled={isDisabled}
+                            className={`mt-4 w-full rounded-2xl px-4 py-3 text-sm font-semibold transition disabled:cursor-not-allowed disabled:opacity-60 ${isCurrent ? 'bg-emerald-500/15 text-emerald-300 ring-1 ring-emerald-500/30' : tier.buttonClass}`}
+                          >
+                            {buttonLabel}
+                          </button>
+                        </div>
+                      </th>
+                    )
+                  })}
+                </tr>
+              </thead>
+              <tbody>
+                {FEATURE_ROWS.map((row, index) => (
+                  <tr key={row.label} className={index % 2 === 0 ? 'bg-slate-950/85' : 'bg-slate-900/80'}>
+                    <td className="border-b border-slate-800 px-5 py-4 text-sm text-slate-400">{row.label}</td>
+                    {TIERS.map(tier => (
+                      <td key={tier.id} className="border-b border-slate-800 px-4 py-4 text-center">
+                        <FeatureValue value={row.getValue(tier)} />
+                      </td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section className="overflow-hidden rounded-[28px] border border-slate-800 bg-[radial-gradient(circle_at_top_left,_rgba(99,102,241,0.18),_transparent_35%),radial-gradient(circle_at_top_right,_rgba(14,165,233,0.14),_transparent_30%),linear-gradient(180deg,_rgba(15,23,42,0.98),_rgba(2,6,23,0.98))]">
+          <div className="px-6 py-7 lg:px-8">
             <div className="rounded-3xl border border-slate-800 bg-slate-950/80 p-5">
               <div className="flex items-start justify-between gap-4">
                 <div>
-                  <p className="text-xs font-semibold uppercase tracking-[0.24em] text-slate-500">Live usage</p>
-                  <p className="mt-2 text-lg font-semibold text-white">Current allocation status</p>
+                  <p className="text-xs font-semibold uppercase tracking-[0.24em] text-slate-500">Billing & Credits</p>
+                  <p className="mt-2 text-lg font-semibold text-white">Current plan summary</p>
                 </div>
                 <span className={`rounded-full px-3 py-1 text-xs font-semibold ${credits > 0 ? 'bg-emerald-500/15 text-emerald-300' : 'bg-rose-500/15 text-rose-300'}`}>
                   {credits > 0 ? 'Ready to render' : 'Balance empty'}
                 </span>
               </div>
 
-              <div className="mt-6 space-y-5">
+              <div className="mt-6 grid gap-4 sm:grid-cols-2">
+                <StatCard
+                  label="Current plan"
+                  value={formatPlan(profile?.subscription_plan)}
+                  helper={hasPrivilegedAccess ? `Billing tier only. ${currentRole} access is handled separately.` : `${currentTier.quality} output with ${watermarkLabel.toLowerCase()}`}
+                />
+                <StatCard
+                  label="Access level"
+                  value={currentRole}
+                  helper={hasPrivilegedAccess ? 'Privileged backend access is active for this account.' : 'Standard customer access.'}
+                />
+                <StatCard
+                  label={isFreePlan ? 'Seconds left' : 'Minutes left'}
+                  value={isFreePlan ? formatSecondsLabel(secondsLeft) : `${minutesLeft} min`}
+                  helper={isFreePlan ? `One-time cap: ${formatSecondsLabel(secondLimit)}` : `Cycle cap: ${minuteLimit} min`}
+                />
+              </div>
+
+              <div className="mt-6">
                 <ProgressRail
-                  label="Minutes consumed"
-                  valueLabel={`${minuteUsagePct}% used`}
-                  percentage={minuteUsagePct}
+                  label={isFreePlan ? 'Seconds consumed' : 'Minutes consumed'}
+                  valueLabel={
+                    isFreePlan
+                      ? `${usedSeconds} / ${secondLimit} sec used`
+                      : `${usedMinutes} / ${minuteLimit} min used`
+                  }
+                  percentage={isFreePlan ? secondsUsagePct : minutesUsagePct}
                   fillClass="bg-gradient-to-r from-indigo-500 to-fuchsia-500"
                 />
-                <ProgressRail
-                  label="Transcript capacity consumed"
-                  valueLabel={`${charUsagePct}% used`}
-                  percentage={charUsagePct}
-                  fillClass="bg-gradient-to-r from-cyan-500 to-emerald-500"
-                />
               </div>
 
-              <div className="mt-6 grid gap-3 sm:grid-cols-2">
-                <div className="rounded-2xl border border-slate-800 bg-slate-900/80 p-4">
-                  <p className="text-xs font-medium text-slate-500">Monthly included</p>
-                  <p className="mt-1 text-lg font-semibold text-white">{maxMinutes.toLocaleString()} min</p>
-                  <p className="mt-1 text-xs text-slate-400">
-                    Current plan allocation from auth profile.
-                  </p>
-                </div>
-                <div className="rounded-2xl border border-slate-800 bg-slate-900/80 p-4">
-                  <p className="text-xs font-medium text-slate-500">Current char pool</p>
-                  <p className="mt-1 text-lg font-semibold text-white">{charsTotalGrant.toLocaleString()} chars</p>
-                  <p className="mt-1 text-xs text-slate-400">
-                    Live tier budget tied to your remaining credits.
-                  </p>
-                </div>
-              </div>
-
-              <div className="mt-6 rounded-2xl border border-slate-800 bg-slate-900/70 p-4">
-                <p className="text-xs font-semibold uppercase tracking-[0.24em] text-slate-500">What this means</p>
-                <div className="mt-3 space-y-2 text-sm text-slate-300">
-                  <p>1. Every completed dub uses 1 credit minute.</p>
-                  <p>2. Transcript-heavy jobs are limited by the remaining character pool.</p>
-                  <p>3. Top-ups add credits immediately after payment confirmation.</p>
-                </div>
-              </div>
-            </div>
-          </div>
-        </section>
-
-        <section className="grid gap-6 xl:grid-cols-[1.5fr_1fr]">
-          <div className="rounded-[28px] border border-slate-800 bg-slate-950/90 p-6">
-            <div className="flex flex-wrap items-end justify-between gap-4">
-              <div>
-                <p className="text-xs font-semibold uppercase tracking-[0.3em] text-slate-500">Monthly plans</p>
-                <h2 className="mt-2 text-2xl font-semibold text-white">Plan-by-plan comparison</h2>
-              </div>
-              <p className="max-w-md text-sm leading-6 text-slate-400">
-                One clean comparison table for every plan, with the same purchase buttons kept directly in the plan columns.
-              </p>
-            </div>
-
-            <div className="mt-6 overflow-x-auto">
-              <table className="min-w-full border-separate border-spacing-0 overflow-hidden rounded-3xl border border-slate-800">
-                <thead>
-                  <tr className="bg-slate-900 align-top">
-                    <th className="border-b border-slate-800 px-5 py-5 text-left text-xs font-semibold uppercase tracking-[0.22em] text-slate-500">
-                      Feature
-                    </th>
-                    {TIERS.map(tier => {
-                      const isCurrent = tier.id === currentPlan
-                      const tierIndex = TIER_ORDER.indexOf(tier.id)
-                      const isUpgrade = tierIndex > currentPlanIndex
-                      const anyBusy = purchasing || switchingFree
-                      const isActive = activePlan === tier.id
-                      const isDisabled = anyBusy || isCurrent
-
-                      let buttonLabel = 'Switch plan'
-                      if (isCurrent) buttonLabel = 'Current plan'
-                      else if (tier.id === 'FREE') buttonLabel = switchingFree && isActive ? 'Switching...' : 'Switch to Free'
-                      else if (isUpgrade) buttonLabel = purchasing && isActive ? 'Connecting...' : 'Upgrade plan'
-                      else buttonLabel = purchasing && isActive ? 'Connecting...' : 'Move to this plan'
-
-                      return (
-                        <th
-                          key={tier.id}
-                          className={`border-b border-slate-800 px-4 py-5 text-center ${isCurrent ? 'bg-emerald-950/20' : ''}`}
-                        >
-                          <div className="mx-auto flex max-w-[180px] flex-col items-center">
-                            <div className="flex items-center gap-2">
-                              <span className={`text-sm font-semibold ${tier.accentClass}`}>{tier.label}</span>
-                              {isCurrent ? (
-                                <span className="rounded-full bg-emerald-500/15 px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.18em] text-emerald-300">
-                                  Active
-                                </span>
-                              ) : tier.badge ? (
-                                <span className="rounded-full bg-fuchsia-500/15 px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.18em] text-fuchsia-300">
-                                  {tier.badge}
-                                </span>
-                              ) : null}
-                            </div>
-                            <p className="mt-3 text-2xl font-bold text-white">{tier.priceDisplay}</p>
-                            <p className="mt-1 text-xs text-slate-500">
-                              {tier.totalPerMonth === 0 ? 'Forever free' : `${formatCurrency(tier.totalPerMonth)} / month`}
-                            </p>
-                            <button
-                              type="button"
-                              onClick={() => void handleSubscribe(tier.id)}
-                              disabled={isDisabled}
-                              className={`mt-4 w-full rounded-2xl px-4 py-3 text-sm font-semibold transition disabled:cursor-not-allowed disabled:opacity-60 ${isCurrent ? 'bg-emerald-500/15 text-emerald-300 ring-1 ring-emerald-500/30' : tier.buttonClass}`}
-                            >
-                              {buttonLabel}
-                            </button>
-                          </div>
-                        </th>
-                      )
-                    })}
-                  </tr>
-                </thead>
-                <tbody>
-                  {FEATURE_ROWS.map((row, index) => (
-                    <tr key={row.label} className={index % 2 === 0 ? 'bg-slate-950/85' : 'bg-slate-900/80'}>
-                      <td className="border-b border-slate-800 px-5 py-4 text-sm text-slate-400">{row.label}</td>
-                      {TIERS.map(tier => (
-                        <td key={tier.id} className="border-b border-slate-800 px-4 py-4 text-center">
-                          <FeatureValue value={row.getValue(tier)} />
-                        </td>
-                      ))}
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </div>
-
-          <div className="rounded-[28px] border border-slate-800 bg-slate-950/90 p-6">
-            <p className="text-xs font-semibold uppercase tracking-[0.3em] text-slate-500">Credit top-ups</p>
-            <h2 className="mt-2 text-2xl font-semibold text-white">Boost balance without changing plan</h2>
-            <p className="mt-3 text-sm leading-6 text-slate-400">
-              These one-time packs already exist in your backend payment flow. They add minutes after PhonePe confirmation and use your current plan&apos;s character rate.
-            </p>
-
-            <div className="mt-6 space-y-4">
-              {CREDIT_PACKS.map(pack => {
-                const isActive = activePack === pack.id
-                const anyBusy = purchasing || switchingFree
-
-                return (
-                  <article key={pack.id} className="rounded-3xl border border-slate-800 bg-slate-900/80 p-5">
-                    <div className="flex items-start justify-between gap-4">
-                      <div>
-                        <p className={`text-sm font-semibold ${pack.accentClass}`}>{pack.label}</p>
-                        <p className="mt-1 text-3xl font-bold text-white">{pack.priceDisplay}</p>
-                      </div>
-                      <span className="rounded-full bg-slate-800 px-3 py-1 text-xs font-semibold text-slate-300">
-                        +{pack.credits} min
-                      </span>
-                    </div>
-
-                    <p className="mt-3 text-sm leading-6 text-slate-400">{pack.description}</p>
-                    <p className="mt-4 text-xs text-slate-500">
-                      Estimated transcript value on your current plan: {(pack.credits * charsPerCredit).toLocaleString()} chars
-                    </p>
-
-                    <button
-                      type="button"
-                      onClick={() => void handleTopUp(pack.id)}
-                      disabled={anyBusy}
-                      className="mt-5 w-full rounded-2xl bg-slate-100 px-4 py-3 text-sm font-semibold text-slate-950 transition hover:bg-white disabled:cursor-not-allowed disabled:opacity-60"
-                    >
-                      {purchasing && isActive ? 'Connecting...' : `Buy ${pack.label}`}
-                    </button>
-                  </article>
-                )
-              })}
-            </div>
-
-            <div className="mt-6 rounded-3xl border border-slate-800 bg-slate-900/70 p-5">
-              <p className="text-sm font-semibold text-white">Voice cloning notice</p>
-              <p className="mt-2 text-xs leading-6 text-slate-400">
-                Use AI dubbing only when you own the source voice or hold explicit permission from the rights holder to recreate it.
-                Unauthorised impersonation may violate applicable law and platform policies.
-              </p>
             </div>
           </div>
         </section>

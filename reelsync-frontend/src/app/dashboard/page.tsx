@@ -5,6 +5,7 @@ import { useRouter } from 'next/navigation'
 import Link from 'next/link'
 import axios from 'axios'
 import api from '@/utils/api'
+import { useSessionProfile } from '@/hooks/useSessionProfile'
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -59,6 +60,7 @@ const LANGUAGES = [
 
 const QUALITY_OPTIONS = [
   { height: 360,  label: '360p',  factor: 1.0 },
+  { height: 420,  label: '420p',  factor: 1.12 },
   { height: 480,  label: '480p',  factor: 1.3 },
   { height: 720,  label: '720p',  factor: 1.8 },
   { height: 1080, label: '1080p', factor: 2.4 },
@@ -279,11 +281,12 @@ const PLAN_META: Record<string, {
   bgClass:     string
   borderClass: string
   ringColor:   string
+  maxOutputHeight: number
 }> = {
-  free:    { label: 'Free',    color: '#64748b', textClass: 'text-slate-400',  bgClass: 'bg-slate-800/40',  borderClass: 'border-slate-700',     ringColor: 'rgba(100,116,139,0.25)' },
-  starter: { label: 'Starter', color: '#6366f1', textClass: 'text-indigo-400', bgClass: 'bg-indigo-950/40', borderClass: 'border-indigo-600/50', ringColor: 'rgba(99,102,241,0.25)'  },
-  creator: { label: 'Creator', color: '#a855f7', textClass: 'text-purple-400', bgClass: 'bg-purple-950/40', borderClass: 'border-purple-600/50', ringColor: 'rgba(168,85,247,0.25)'  },
-  pro:     { label: 'Pro',     color: '#f59e0b', textClass: 'text-amber-400',  bgClass: 'bg-amber-950/30',  borderClass: 'border-amber-500/50',  ringColor: 'rgba(245,158,11,0.25)'  },
+  free:    { label: 'Free',    color: '#64748b', textClass: 'text-slate-400',  bgClass: 'bg-slate-800/40',  borderClass: 'border-slate-700',     ringColor: 'rgba(100,116,139,0.25)', maxOutputHeight: 420  },
+  starter: { label: 'Starter', color: '#6366f1', textClass: 'text-indigo-400', bgClass: 'bg-indigo-950/40', borderClass: 'border-indigo-600/50', ringColor: 'rgba(99,102,241,0.25)',  maxOutputHeight: 1080 },
+  creator: { label: 'Creator', color: '#a855f7', textClass: 'text-purple-400', bgClass: 'bg-purple-950/40', borderClass: 'border-purple-600/50', ringColor: 'rgba(168,85,247,0.25)',  maxOutputHeight: 2160 },
+  pro:     { label: 'Pro',     color: '#f59e0b', textClass: 'text-amber-400',  bgClass: 'bg-amber-950/30',  borderClass: 'border-amber-500/50',  ringColor: 'rgba(245,158,11,0.25)',  maxOutputHeight: 2160 },
 }
 
 const THUMB_GRADIENTS = [
@@ -330,6 +333,7 @@ interface ProjectHistoryItem {
   project_id: string
   title: string
   created_at: string | null             // project upload date
+  original_video_path: string | null
   latest_job_id: string | null
   latest_job_status: string | null
   latest_job_language: string | null
@@ -349,6 +353,110 @@ interface UploadResponse {
   title: string
   local_path: string
   message: string
+}
+
+function RenderPreviewModal({
+  project,
+  canDownload,
+  onClose,
+}: {
+  project: ProjectHistoryItem
+  canDownload: boolean
+  onClose: () => void
+}) {
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onClose()
+    }
+    document.addEventListener('keydown', handleKeyDown)
+    return () => document.removeEventListener('keydown', handleKeyDown)
+  }, [onClose])
+
+  const base = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000'
+  const token = typeof window !== 'undefined' ? (localStorage.getItem('access_token') ?? '') : ''
+  const outputFilename = project.output_video_path?.replace(/\\/g, '/').split('/').pop() ?? ''
+  const inputFilename = project.original_video_path?.replace(/\\/g, '/').split('/').pop() ?? ''
+  const dubbedUrl = outputFilename
+    ? `${base}/downloads/${outputFilename}?token=${encodeURIComponent(token)}`
+    : ''
+  const originalUrl = inputFilename
+    ? `${base}/originals/${inputFilename}?token=${encodeURIComponent(token)}`
+    : ''
+
+  return (
+    <div className="fixed inset-0 z-[120] flex items-center justify-center bg-black/80 px-4 py-6 backdrop-blur-sm">
+      <div className="flex max-h-[90vh] w-full max-w-6xl flex-col overflow-hidden rounded-3xl border border-slate-800 bg-slate-950 shadow-2xl">
+        <div className="flex items-start justify-between gap-4 border-b border-slate-800 bg-slate-950 px-5 py-4">
+          <div>
+            <h3 className="text-base font-bold text-white">{project.title || 'Untitled Render'}</h3>
+            <p className="mt-1 text-xs text-slate-400">Preview the original upload against the dubbed output.</p>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded-xl p-2 text-slate-500 transition hover:bg-slate-800 hover:text-slate-200"
+          >
+            <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+            </svg>
+          </button>
+        </div>
+
+        <div className="grid flex-1 grid-cols-1 gap-4 overflow-y-auto bg-slate-900/40 p-4 md:grid-cols-2">
+          <div className="flex flex-col gap-2">
+            <span className="px-1 text-xs font-semibold uppercase tracking-[0.24em] text-slate-500">Original Video</span>
+            <div className="relative aspect-[16/10] overflow-hidden rounded-2xl border border-slate-800 bg-black">
+              {originalUrl ? (
+                <video src={originalUrl} controls className="h-full w-full object-contain" />
+              ) : (
+                <div className="flex h-full w-full items-center justify-center px-6 text-center text-xs text-slate-600">
+                  Original upload preview is not available for this render.
+                </div>
+              )}
+            </div>
+          </div>
+
+          <div className="flex flex-col gap-2">
+            <span className="px-1 text-xs font-semibold uppercase tracking-[0.24em] text-emerald-400">Dubbed Video</span>
+            <div className="relative aspect-[16/10] overflow-hidden rounded-2xl border border-emerald-900/40 bg-black">
+              {dubbedUrl ? (
+                <video src={dubbedUrl} controls className="h-full w-full object-contain" />
+              ) : (
+                <div className="flex h-full w-full items-center justify-center px-6 text-center text-xs text-slate-600">
+                  Dubbed output is not available yet.
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+
+        <div className="flex items-center justify-end gap-3 border-t border-slate-800 bg-slate-950 px-5 py-3">
+          {!canDownload && (
+            <span className="mr-auto text-xs font-medium text-amber-300">Free plan: preview only</span>
+          )}
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded-xl bg-slate-800 px-4 py-2 text-xs font-semibold text-slate-200 transition hover:bg-slate-700"
+          >
+            Close Preview
+          </button>
+          {canDownload && dubbedUrl && (
+            <a
+              href={dubbedUrl}
+              download
+              className="inline-flex items-center gap-1.5 rounded-xl border border-emerald-500/50 bg-emerald-600 px-4 py-2 text-xs font-semibold text-white transition hover:bg-emerald-500"
+            >
+              <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+              </svg>
+              Download Video
+            </a>
+          )}
+        </div>
+      </div>
+    </div>
+  )
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -546,7 +654,6 @@ export default function DashboardPage() {
   const router     = useRouter()
   const fileInputRef = useRef<HTMLInputElement>(null)
 
-  const [profile,        setProfile]        = useState<UserProfile | null>(null)
   const [projects,       setProjects]       = useState<ProjectHistoryItem[]>([])
   const [loading,        setLoading]        = useState(true)
   const [pageError,      setPageError]      = useState('')
@@ -571,11 +678,16 @@ export default function DashboardPage() {
   const [sortField,         setSortField]         = useState('created_at')
   const [sortDir,           setSortDir]           = useState<'asc' | 'desc'>('desc')
   const [reworkTarget,      setReworkTarget]      = useState<{ project_id: string; title: string; scene_name?: string } | null>(null)
+  const [previewTarget,     setPreviewTarget]     = useState<ProjectHistoryItem | null>(null)
   const [reworkVoiceLang,   setReworkVoiceLang]   = useState('hi')
   const [reworkSubLang,     setReworkSubLang]     = useState('en')
   const [reworkSceneName,   setReworkSceneName]   = useState('')
   const [reworking,         setReworking]         = useState(false)
   const [reworkError,       setReworkError]       = useState('')
+  const { profile } = useSessionProfile<UserProfile>({
+    redirectOnUnauthorized: true,
+    onUnauthorized: () => router.replace('/login'),
+  })
 
   const tip = useMemo(() => PLATFORM_TIPS[Math.floor(Math.random() * PLATFORM_TIPS.length)], [])
 
@@ -587,26 +699,15 @@ export default function DashboardPage() {
 
   const loadData = async () => {
     try {
-      const [profileRes, projectsRes] = await Promise.allSettled([
-        api.get<UserProfile>('/api/auth/me'),
-        api.get<ProjectHistoryItem[]>('/api/videos/projects'),
-      ])
-
-      if (profileRes.status === 'fulfilled') {
-        setProfile(profileRes.value.data)
-      } else {
-        const reason = (profileRes as PromiseRejectedResult).reason
-        if (axios.isAxiosError(reason) && reason.response?.status === 401) {
-          localStorage.clear()
-          router.replace('/login')
-          return
-        }
-        setPageError('Failed to load workspace data.')
+      const { data } = await api.get<ProjectHistoryItem[]>('/api/videos/projects')
+      setProjects(data)
+    } catch (reason) {
+      if (axios.isAxiosError(reason) && reason.response?.status === 401) {
+        localStorage.clear()
+        router.replace('/login')
+        return
       }
-
-      if (projectsRes.status === 'fulfilled') {
-        setProjects(projectsRes.value.data)
-      }
+      setPageError('Failed to load workspace data.')
     } finally {
       setLoading(false)
     }
@@ -761,7 +862,7 @@ export default function DashboardPage() {
       await api.post(`/api/videos/process/${uploadData.project_id}`, {
         target_voice_language:       language,
         target_subtitle_language:    subtitleLanguage,
-        target_resolution_height:    selectedResolution,
+        target_resolution_height:    safeSelectedResolution,
         target_aspect_ratio:         selectedAspectRatio,
       })
 
@@ -857,6 +958,7 @@ export default function DashboardPage() {
   // ── Derived values ─────────────────────────────────────────────────────────
   const plan        = (profile?.subscription_plan ?? 'free').toLowerCase()
   const isFree      = plan === 'free'
+  const canDownloadRenderedVideo = !isFree
   const planMeta    = PLAN_META[plan] ?? PLAN_META.free
   const credits     = profile?.credit_minutes ?? 0
   const maxMin      = profile?.credit_limit_minutes ?? 2
@@ -869,15 +971,27 @@ export default function DashboardPage() {
     selectedFile && uploadPhase !== 'uploading' && uploadPhase !== 'queued'
   )
 
-  const availableResolutions = useMemo(() => QUALITY_OPTIONS, [])
+  const availableResolutions = useMemo(
+    () => QUALITY_OPTIONS.filter(option => option.height <= planMeta.maxOutputHeight),
+    [planMeta.maxOutputHeight],
+  )
+
+  const safeSelectedResolution = useMemo(() => {
+    if (!availableResolutions.length) {
+      return Math.min(selectedResolution, planMeta.maxOutputHeight)
+    }
+    return availableResolutions.some(option => option.height === selectedResolution)
+      ? selectedResolution
+      : availableResolutions[availableResolutions.length - 1].height
+  }, [availableResolutions, planMeta.maxOutputHeight, selectedResolution])
 
   const isAiEnhancementActive = Boolean(
-    videoMetadata && selectedResolution > videoMetadata.height
+    videoMetadata && safeSelectedResolution > videoMetadata.height
   )
 
   const estimatedCompletion = useMemo(
-    () => estimateCompletionTime(selectedResolution, selectedAspectRatio, isAiEnhancementActive),
-    [selectedResolution, selectedAspectRatio, isAiEnhancementActive],
+    () => estimateCompletionTime(safeSelectedResolution, selectedAspectRatio, isAiEnhancementActive),
+    [safeSelectedResolution, selectedAspectRatio, isAiEnhancementActive],
   )
 
   useEffect(() => {
@@ -913,6 +1027,13 @@ export default function DashboardPage() {
 
   return (
     <>
+    {previewTarget && (
+      <RenderPreviewModal
+        project={previewTarget}
+        canDownload={canDownloadRenderedVideo}
+        onClose={() => setPreviewTarget(null)}
+      />
+    )}
     {/* ── Delete confirmation modal ─────────────────────────────────────────── */}
     {deleteTarget && (
       <div className="fixed inset-0 z-50 flex items-center justify-center px-4 bg-black/60 backdrop-blur-sm">
@@ -1432,6 +1553,9 @@ export default function DashboardPage() {
                       <p className="text-sm font-semibold text-white">
                         {videoMetadata ? `${videoMetadata.width}x${videoMetadata.height} source detected` : 'Select a target resolution'}
                       </p>
+                      <p className="mt-1 text-xs text-slate-500">
+                        {planMeta.label} plan: up to {planMeta.maxOutputHeight}p output
+                      </p>
                     </div>
                     <div className="text-right">
                       <p className="text-xs text-slate-500 uppercase tracking-[0.22em] mb-1">ETC</p>
@@ -1441,7 +1565,7 @@ export default function DashboardPage() {
                 </div>
                 <div>
                   <select
-                    value={selectedResolution}
+                    value={safeSelectedResolution}
                     onChange={e => setSelectedResolution(Number(e.target.value))}
                     className="w-full bg-slate-900 border border-slate-700/80 rounded-xl px-4 py-3 text-sm text-white appearance-none focus:outline-none focus:ring-2 focus:ring-indigo-500/40 focus:border-indigo-600/60 transition-all"
                   >
@@ -1458,7 +1582,9 @@ export default function DashboardPage() {
                   </p>
                 ) : (
                   <p className="text-xs text-slate-500">
-                    The selected aspect ratio and output height are sent to the render API; the backend will preserve proportions with a scale/pad filter.
+                    {isFree
+                      ? 'Free accounts are locked to 420p max output. Any higher source quality is capped before rendering.'
+                      : 'The selected aspect ratio and output height are sent to the render API, and your plan cap is enforced before final rendering.'}
                   </p>
                 )}
               </div>
@@ -1827,18 +1953,38 @@ export default function DashboardPage() {
                       <td className="px-6 py-4">
                         <div className="flex items-center justify-end gap-2">
 
-                          {/* Completed — download available to all plans */}
+                          {/* Completed — always allow preview, downloads only on paid plans */}
                           {isCompleted && filename && (
-                            <a
-                              href={downloadUrl}
-                              download
-                              className="inline-flex items-center gap-1.5 text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-500 border border-emerald-500/50 rounded-lg px-3 py-1.5 transition-all shadow-sm shadow-emerald-900/40"
+                            <button
+                              type="button"
+                              onClick={() => setPreviewTarget(p)}
+                              className="inline-flex items-center gap-1.5 rounded-lg border border-indigo-500/50 bg-indigo-600/80 px-3 py-1.5 text-xs font-semibold text-white transition-all hover:bg-indigo-600"
                             >
-                              <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                                <path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                              <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                                <path strokeLinecap="round" strokeLinejoin="round" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.868v4.264a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" />
+                                <path strokeLinecap="round" strokeLinejoin="round" d="M21 12c0 4.97-4.03 9-9 9s-9-4.03-9-9 4.03-9 9-9 9 4.03 9 9z" />
                               </svg>
-                              Download Video
-                            </a>
+                              Preview
+                            </button>
+                          )}
+
+                          {isCompleted && filename && (
+                            canDownloadRenderedVideo ? (
+                              <a
+                                href={downloadUrl}
+                                download
+                                className="inline-flex items-center gap-1.5 text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-500 border border-emerald-500/50 rounded-lg px-3 py-1.5 transition-all shadow-sm shadow-emerald-900/40"
+                              >
+                                <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                                  <path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                                </svg>
+                                Download Video
+                              </a>
+                            ) : (
+                              <span className="inline-flex items-center gap-1.5 rounded-lg border border-amber-800/40 bg-amber-950/30 px-3 py-1.5 text-xs font-medium text-amber-300">
+                                Preview only
+                              </span>
+                            )
                           )}
 
                           {/* In-progress / pending: disabled locked button */}

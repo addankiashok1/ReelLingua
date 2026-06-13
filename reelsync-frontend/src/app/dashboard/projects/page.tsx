@@ -4,6 +4,7 @@ import React, { useCallback, useEffect, useRef, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import api from '@/utils/api'
 import { toast } from '@/components/Toast'
+import { useSessionProfile } from '@/hooks/useSessionProfile'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -359,8 +360,14 @@ export default function ProjectsPage() {
   const router = useRouter()
   const [projects,       setProjects]       = useState<ProjectFolder[]>([])
   const [loading,        setLoading]        = useState(true)
+  const [accessChecked,  setAccessChecked]  = useState(false)
+  const [accessDenied,   setAccessDenied]   = useState(false)
   const [modal,          setModal]          = useState<ModalState>({ type: 'none' })
   const [openDropdownId, setOpenDropdownId] = useState<string | null>(null)
+  const { profile } = useSessionProfile({
+    redirectOnUnauthorized: true,
+    onUnauthorized: () => router.replace('/login'),
+  })
 
   // NOTE: No document-level click listener here.
   // The open/close logic lives entirely in FolderCard's mousedown handler so
@@ -373,14 +380,33 @@ export default function ProjectsPage() {
     try {
       const res = await api.get<ProjectFolder[]>('/api/projects')
       setProjects(res.data)
-    } catch {
-      // stay empty on error
+      setAccessDenied(false)
+    } catch (err: any) {
+      if (err.response?.status === 403) {
+        setAccessDenied(true)
+      }
     } finally {
       setLoading(false)
     }
   }, [])
 
-  useEffect(() => { fetchProjects() }, [fetchProjects])
+  useEffect(() => {
+    if (profile === null) return
+    const role = (profile.role ?? 'USER').toUpperCase()
+    const plan = (profile.subscription_plan ?? 'free').toLowerCase()
+    const hasWorkspaceAccess = role === 'ROOT' || role === 'ADMIN' || plan !== 'free'
+
+    if (!hasWorkspaceAccess) {
+      setAccessDenied(true)
+      setAccessChecked(true)
+      router.replace('/dashboard/billing?restricted=projects')
+      return
+    }
+
+    setAccessDenied(false)
+    setAccessChecked(true)
+    void fetchProjects()
+  }, [fetchProjects, profile, router])
 
   const handleCreated = useCallback((p: ProjectFolder) => setProjects(prev => [p, ...prev]), [])
   const handleRenamed = useCallback((updated: ProjectFolder) => setProjects(prev => prev.map(p => p.project_id === updated.project_id ? updated : p)), [])
@@ -398,22 +424,40 @@ export default function ProjectsPage() {
             Organise your work into project folders. Open a folder to manage its scenes.
           </p>
         </div>
-        <button
-          onClick={() => setModal({ type: 'create' })}
-          className="flex items-center gap-2 px-4 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-medium rounded-xl transition-colors shadow-lg shadow-indigo-900/30"
-        >
-          <IconPlus className="w-4 h-4" />
-          New Project
-        </button>
+        {!accessDenied && (
+          <button
+            onClick={() => setModal({ type: 'create' })}
+            className="flex items-center gap-2 px-4 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-medium rounded-xl transition-colors shadow-lg shadow-indigo-900/30"
+          >
+            <IconPlus className="w-4 h-4" />
+            New Project
+          </button>
+        )}
       </div>
 
       {/* Content */}
-      {loading ? (
+      {!accessChecked || loading ? (
         <div className="flex-1 flex items-center justify-center">
           <div className="flex flex-col items-center gap-3">
             <div className="w-8 h-8 border-2 border-indigo-500 border-t-transparent rounded-full animate-spin" />
             <p className="text-sm text-slate-500">Loading projects…</p>
           </div>
+        </div>
+      ) : accessDenied ? (
+        <div className="flex-1 flex flex-col items-center justify-center gap-4 text-center">
+          <div className="w-16 h-16 rounded-2xl bg-amber-500/10 flex items-center justify-center">
+            <IconFolder className="w-8 h-8 text-amber-300" />
+          </div>
+          <div>
+            <p className="text-base font-semibold text-slate-200">Projects are locked on Free</p>
+            <p className="text-sm text-slate-500 mt-1">Upgrade to Starter or above to open the Projects workspace.</p>
+          </div>
+          <button
+            onClick={() => router.push('/dashboard/billing?restricted=projects')}
+            className="flex items-center gap-2 px-5 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-medium rounded-xl transition-colors"
+          >
+            Upgrade Plan
+          </button>
         </div>
       ) : projects.length === 0 ? (
         <div className="flex-1 flex flex-col items-center justify-center gap-4 text-center">

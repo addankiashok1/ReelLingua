@@ -1,3 +1,4 @@
+import enum
 import uuid
 from datetime import datetime
 
@@ -5,6 +6,7 @@ from sqlalchemy import (
     Boolean,
     Column,
     DateTime,
+    Enum,
     ForeignKey,
     Integer,
     SmallInteger,
@@ -17,6 +19,21 @@ from sqlalchemy.orm import DeclarativeBase, relationship
 
 class Base(DeclarativeBase):
     pass
+
+
+class UserRole(str, enum.Enum):
+    USER = "USER"
+    ADMIN = "ADMIN"
+    ROOT = "ROOT"
+
+
+ROOT_BOOTSTRAP_EMAIL = "ashokaddanki602@gmail.com"
+
+
+def bootstrap_role_for_email(email: str | None) -> UserRole:
+    if (email or "").strip().lower() == ROOT_BOOTSTRAP_EMAIL:
+        return UserRole.ROOT
+    return UserRole.USER
 
 
 class OTPVerification(Base):
@@ -50,9 +67,24 @@ class User(Base):
     email = Column(String(320), unique=True, nullable=False, index=True)
     phone_number = Column(String(20), unique=True, nullable=True, index=True)
     hashed_password = Column(String, nullable=False)
-    credit_minutes = Column(Integer, nullable=False, default=7)
-    seconds_balance = Column(Integer, nullable=False, default=420, server_default="420")
+    # `credit_minutes` is a compact display/cache field derived from the protected
+    # second-based allowance held in `seconds_balance`.
+    credit_minutes = Column(Integer, nullable=False, default=1)
+    # Authoritative per-cycle allowance storage. This is the backend-enforced
+    # ReelSync quota derived from the protected 70% customer pool.
+    seconds_balance = Column(Integer, nullable=False, default=60, server_default="60")
     subscription_plan = Column(String(50), nullable=False, default="free", server_default="free")
+    role = Column(
+        Enum(
+            UserRole,
+            name="user_role",
+            native_enum=False,
+            values_callable=lambda enum_cls: [member.value for member in enum_cls],
+        ),
+        nullable=False,
+        default=UserRole.USER,
+        server_default=UserRole.USER.value,
+    )
     chars_balance = Column(Integer, nullable=False, default=0, server_default="0")
     profile_picture_url = Column(String(500), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)

@@ -1,20 +1,21 @@
 import logging
 import os
 import uuid
+from typing import Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from jose import JWTError, jwt
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import config
 from billing import APP_PLAN_TIMERS, LEGACY_BASE_MINUTES
 from config import settings
 from database import engine, get_db
-from models.db_models import Base, ExplorerFolder, Folder, OTPVerification, PasswordResetOTP, PaymentTransaction, SceneEditHistory, User  # noqa: F401 — registers models with Base
+from models.db_models import Base, ExplorerFolder, Folder, OTPVerification, PasswordResetOTP, PaymentTransaction, ROOT_BOOTSTRAP_EMAIL, SceneEditHistory, User, UserRole  # noqa: F401 — registers models with Base
 from routers import auth, payments, user, videos
 from routers import explorer, projects, trash
 from routers.auth import ALGORITHM
@@ -88,8 +89,8 @@ async def download_video(
     # ── Validate JWT ─────────────────────────────────────────────────────────
     try:
         payload = jwt.decode(token, settings.jwt_secret_key, algorithms=[ALGORITHM])
-        user_id_str: str = payload.get("sub", "")
-        if not user_id_str:
+        subject: Optional[str] = payload.get("sub")
+        if not subject:
             raise JWTError("Missing subject")
     except JWTError:
         raise HTTPException(
@@ -98,19 +99,30 @@ async def download_video(
         )
 
     # ── Resolve user ──────────────────────────────────────────────────────────
-    try:
-        user_uuid = uuid.UUID(user_id_str)
-    except ValueError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Malformed token subject.",
-        )
+    user: User | None = None
+    token_user_id: Optional[str] = payload.get("user_id")
 
-    user: User | None = await db.get(User, user_uuid)
+    if token_user_id:
+        try:
+            user = await db.get(User, uuid.UUID(token_user_id))
+        except ValueError:
+            user = None
+
+    if not user:
+        try:
+            legacy_user_id = uuid.UUID(subject)
+        except ValueError:
+            result = await db.execute(
+                select(User).where(User.email == subject.strip().lower())
+            )
+            user = result.scalar_one_or_none()
+        else:
+            user = await db.get(User, legacy_user_id)
+
     if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="User no longer exists.",
+            detail="User associated with this token no longer exists.",
         )
 
     # ── Serve only from the user's own output directory ───────────────────────
@@ -152,8 +164,8 @@ async def stream_original_video(
     # ── Validate JWT ─────────────────────────────────────────────────────────
     try:
         payload = jwt.decode(token, settings.jwt_secret_key, algorithms=[ALGORITHM])
-        user_id_str: str = payload.get("sub", "")
-        if not user_id_str:
+        subject: Optional[str] = payload.get("sub")
+        if not subject:
             raise JWTError("Missing subject")
     except JWTError:
         raise HTTPException(
@@ -162,19 +174,30 @@ async def stream_original_video(
         )
 
     # ── Resolve user ──────────────────────────────────────────────────────────
-    try:
-        user_uuid = uuid.UUID(user_id_str)
-    except ValueError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Malformed token subject.",
-        )
+    original_user: User | None = None
+    token_user_id: Optional[str] = payload.get("user_id")
 
-    original_user: User | None = await db.get(User, user_uuid)
+    if token_user_id:
+        try:
+            original_user = await db.get(User, uuid.UUID(token_user_id))
+        except ValueError:
+            original_user = None
+
+    if not original_user:
+        try:
+            legacy_user_id = uuid.UUID(subject)
+        except ValueError:
+            result = await db.execute(
+                select(User).where(User.email == subject.strip().lower())
+            )
+            original_user = result.scalar_one_or_none()
+        else:
+            original_user = await db.get(User, legacy_user_id)
+
     if not original_user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="User no longer exists.",
+            detail="User associated with this token no longer exists.",
         )
 
     # ── Path-traversal guard ──────────────────────────────────────────────────
@@ -220,6 +243,17 @@ async def create_tables() -> None:
         ))
         await conn.execute(text(
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS "
+            "role VARCHAR(20) NOT NULL DEFAULT 'USER'"
+        ))
+        await conn.execute(text(
+            "UPDATE users SET role = 'USER' WHERE role IS NULL OR trim(role) = ''"
+        ))
+        await conn.execute(
+            text("UPDATE users SET role = :role WHERE lower(email) = :email"),
+            {"role": UserRole.ROOT.value, "email": ROOT_BOOTSTRAP_EMAIL.lower()},
+        )
+        await conn.execute(text(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS "
             "seconds_balance INTEGER NOT NULL DEFAULT 0"
         ))
         await conn.execute(text(
@@ -261,10 +295,22 @@ async def create_tables() -> None:
         ))
         await conn.execute(text(
             "UPDATE users "
-            "SET credit_minutes = CAST(CEIL(seconds_balance / 60.0) AS INTEGER)"
+            "SET credit_minutes = CASE "
+            "WHEN seconds_balance <= 0 THEN 0 "
+            "WHEN seconds_balance < 60 THEN 1 "
+            "ELSE CAST(FLOOR(seconds_balance / 60) AS INTEGER) "
+            "END"
         ))
         await conn.execute(text(
-            "ALTER TABLE users ALTER COLUMN seconds_balance SET DEFAULT 420"
+            "UPDATE users "
+            f"SET seconds_balance = {free_allowed}, "
+            "credit_minutes = 1 "
+            "WHERE lower(subscription_plan) = 'free' "
+            f"AND seconds_balance > {free_allowed} "
+            "AND upper(COALESCE(role, 'USER')) NOT IN ('ADMIN', 'ROOT')"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE users ALTER COLUMN seconds_balance SET DEFAULT 60"
         ))
         # ── Projects & Folders workspace migration ──────────────────────────
         # folders table (created by Base.metadata.create_all above if not present,

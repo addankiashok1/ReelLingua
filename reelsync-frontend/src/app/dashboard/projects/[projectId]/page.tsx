@@ -4,6 +4,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useParams, usePathname, useRouter, useSearchParams } from 'next/navigation'
 import api from '@/utils/api'
 import { toast } from '@/components/Toast'
+import { useSessionProfile } from '@/hooks/useSessionProfile'
 
 // ─── Language maps ────────────────────────────────────────────────────────────
 
@@ -73,6 +74,7 @@ interface FolderItem {
 
 const QUALITY_PRESETS = [
   { label: '360p',          height: 360  },
+  { label: '420p',          height: 420  },
   { label: '480p',          height: 480  },
   { label: '720p (HD)',     height: 720  },
   { label: '1080p (FHD)',   height: 1080 },
@@ -80,25 +82,43 @@ const QUALITY_PRESETS = [
   { label: '2160p (4K)',    height: 2160 },
 ] as const
 
+const PLAN_MAX_OUTPUT_HEIGHT: Record<string, number> = {
+  free: 420,
+  starter: 1080,
+  creator: 2160,
+  pro: 2160,
+}
+
 /** Returns presets available for a given native height (never allows upscaling). */
 const DEFAULT_OUTPUT_HEIGHT = 720
 
-function availablePresets(nativeHeight: number | null) {
-  if (!nativeHeight) return QUALITY_PRESETS
-  return QUALITY_PRESETS.filter(p => p.height <= nativeHeight)
+function getPlanMaxOutputHeight(plan: string | null | undefined) {
+  return PLAN_MAX_OUTPUT_HEIGHT[(plan ?? 'free').toLowerCase()] ?? PLAN_MAX_OUTPUT_HEIGHT.free
 }
 
-function getQualityLabel(outputHeight: number, nativeHeight: number | null) {
+function availablePresets(nativeHeight: number | null, planMaxHeight: number) {
+  const cappedPresets = QUALITY_PRESETS.filter(p => p.height <= planMaxHeight)
+  if (!nativeHeight) return cappedPresets
+  return cappedPresets.filter(p => p.height <= nativeHeight)
+}
+
+function getQualityLabel(outputHeight: number, nativeHeight: number | null, planMaxHeight: number) {
   if (outputHeight === 0) {
+    if (nativeHeight && nativeHeight > planMaxHeight) {
+      return `Capped to ${planMaxHeight}p`
+    }
     return nativeHeight ? `Match source (${nativeHeight}p)` : 'Match source'
   }
   const preset = QUALITY_PRESETS.find(p => p.height === outputHeight)
   return preset?.label ?? `${outputHeight}p`
 }
 
-function estimateRenderTime(outputHeight: number, nativeHeight: number | null) {
-  const height = outputHeight === 0 ? nativeHeight ?? DEFAULT_OUTPUT_HEIGHT : outputHeight
+function estimateRenderTime(outputHeight: number, nativeHeight: number | null, planMaxHeight: number) {
+  const height = outputHeight === 0
+    ? Math.min(nativeHeight ?? DEFAULT_OUTPUT_HEIGHT, planMaxHeight)
+    : outputHeight
   if (height <= 360) return '≈ 1m'
+  if (height <= 420) return '≈ 1m 10s'
   if (height <= 480) return '≈ 1m 15s'
   if (height <= 720) return '≈ 1m 45s'
   if (height <= 1080) return '≈ 2m 30s'
@@ -568,11 +588,13 @@ function QCComparisonModal({
   scene,
   projectOriginalVideoPath,
   token,
+  canDownload,
   onClose,
 }: {
   scene: SceneItem
   projectOriginalVideoPath: string | null
   token: string
+  canDownload: boolean
   onClose: () => void
 }) {
   useEffect(() => {
@@ -673,14 +695,19 @@ function QCComparisonModal({
           >
             Close Preview
           </button>
-          <button
-            onClick={handleDownload}
-            disabled={!download_url}
-            className="px-4 py-1.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 text-white text-xs font-medium rounded-lg transition flex items-center gap-1.5"
-          >
-            <IcoDownload className="w-3.5 h-3.5" />
-            Download Final Master
-          </button>
+          {!canDownload && (
+            <span className="mr-1 text-xs font-medium text-amber-300">Free plan: preview only</span>
+          )}
+          {canDownload && (
+            <button
+              onClick={handleDownload}
+              disabled={!download_url}
+              className="px-4 py-1.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 text-white text-xs font-medium rounded-lg transition flex items-center gap-1.5"
+            >
+              <IcoDownload className="w-3.5 h-3.5" />
+              Download Final Master
+            </button>
+          )}
         </div>
 
       </div>
@@ -693,11 +720,13 @@ function QCComparisonModal({
 function AddSceneModal({
   projectId,
   currentFolderId,
+  planMaxHeight,
   onClose,
   onQueued,
 }: {
   projectId: string
   currentFolderId: string | null
+  planMaxHeight: number
   onClose: () => void
   onQueued: (scene: SceneItem) => void
 }) {
@@ -719,17 +748,24 @@ function AddSceneModal({
     if (!sceneName) setSceneName(f.name.replace(/\.[^.]+$/, ''))
     const h = await detectVideoHeight(f)
     setNativeHeight(h)
-    if (h && h >= DEFAULT_OUTPUT_HEIGHT) {
-      setOutputHeight(DEFAULT_OUTPUT_HEIGHT)
+    const preferredHeight = Math.min(DEFAULT_OUTPUT_HEIGHT, planMaxHeight)
+    if (h && h >= preferredHeight) {
+      setOutputHeight(preferredHeight)
     } else {
       setOutputHeight(0)
     }
-  }, [sceneName])
+  }, [planMaxHeight, sceneName])
 
-  const presets = availablePresets(nativeHeight)
+  const presets = availablePresets(nativeHeight, planMaxHeight)
 
-  const selectedQualityLabel = useMemo(() => getQualityLabel(outputHeight, nativeHeight), [outputHeight, nativeHeight])
-  const estimatedTime = useMemo(() => estimateRenderTime(outputHeight, nativeHeight), [outputHeight, nativeHeight])
+  const selectedQualityLabel = useMemo(
+    () => getQualityLabel(outputHeight, nativeHeight, planMaxHeight),
+    [outputHeight, nativeHeight, planMaxHeight],
+  )
+  const estimatedTime = useMemo(
+    () => estimateRenderTime(outputHeight, nativeHeight, planMaxHeight),
+    [outputHeight, nativeHeight, planMaxHeight],
+  )
 
   const handleSubmit = useCallback(async (e: React.FormEvent) => {
     e.preventDefault()
@@ -870,7 +906,7 @@ function AddSceneModal({
               Output Quality
               {nativeHeight && (
                 <span className="ml-1.5 text-slate-600 font-normal">
-                  — source is {nativeHeight}p; options above it are hidden
+                  — source is {nativeHeight}p; plan max is {planMaxHeight}p
                 </span>
               )}
             </label>
@@ -916,7 +952,7 @@ function AddSceneModal({
                 </div>
               </div>
               <p className="mt-3 text-xs leading-5 text-slate-500">
-                Higher resolutions take longer to encode. If you choose a height above the source, the backend will keep the original native height.
+              Higher resolutions take longer to encode. Your plan cap is enforced before the render starts.
               </p>
             </div>
           )}
@@ -943,10 +979,12 @@ function AddSceneModal({
 
 function EditSceneModal({
   scene,
+  planMaxHeight,
   onClose,
   onReprocessed,
 }: {
   scene: SceneItem
+  planMaxHeight: number
   onClose: () => void
   onReprocessed: (updated: SceneItem) => void
 }) {
@@ -958,21 +996,24 @@ function EditSceneModal({
   const [sourceLang,   setSourceLang]   = useState(
     supportedVoiceCodes.has(scene.source_language ?? '') ? (scene.source_language ?? 'auto') : 'auto'
   )
+  const initialOutputHeight = scene.output_height ?? (
+    scene.original_height && scene.original_height > planMaxHeight ? planMaxHeight : 0
+  )
   // Initialise to the current job's output_height (0 = match source)
-  const [outputHeight, setOutputHeight] = useState<number>(scene.output_height ?? 0)
+  const [outputHeight, setOutputHeight] = useState<number>(initialOutputHeight)
   const [saving, setSaving] = useState(false)
   const [error,  setError]  = useState('')
 
   // Presets capped to the original resolution — uses the server-derived value
   // so it is always accurate (not the browser estimate used during upload).
-  const editPresets = availablePresets(scene.original_height ?? null)
+  const editPresets = availablePresets(scene.original_height ?? null, planMaxHeight)
   const selectedQualityLabel = useMemo(
-    () => getQualityLabel(outputHeight, scene.original_height ?? null),
-    [outputHeight, scene.original_height]
+    () => getQualityLabel(outputHeight, scene.original_height ?? null, planMaxHeight),
+    [outputHeight, scene.original_height, planMaxHeight]
   )
   const estimatedTime = useMemo(
-    () => estimateRenderTime(outputHeight, scene.original_height ?? null),
-    [outputHeight, scene.original_height]
+    () => estimateRenderTime(outputHeight, scene.original_height ?? null, planMaxHeight),
+    [outputHeight, scene.original_height, planMaxHeight]
   )
 
   const handleSubmit = useCallback(async (e: React.FormEvent) => {
@@ -996,7 +1037,7 @@ function EditSceneModal({
   const changed = voiceLang    !== scene.target_voice_lang
     || subtitleLang !== (scene.target_subtitle_lang ?? 'en')
     || sourceLang   !== (scene.source_language ?? 'auto')
-    || outputHeight !== (scene.output_height ?? 0)
+    || outputHeight !== initialOutputHeight
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm px-4">
@@ -1062,7 +1103,7 @@ function EditSceneModal({
               Output Quality
               {scene.original_height && (
                 <span className="ml-1.5 text-slate-600 font-normal">
-                  — source is {scene.original_height}p
+                  — source is {scene.original_height}p; plan max is {planMaxHeight}p
                 </span>
               )}
             </label>
@@ -1107,7 +1148,7 @@ function EditSceneModal({
               </div>
             </div>
             <p className="mt-3 text-xs leading-5 text-slate-500">
-              Higher resolutions take longer to encode. If you choose a height above the source, the backend will preserve the native resolution.
+              Higher resolutions take longer to encode. Your plan cap is enforced before the render starts.
             </p>
           </div>
 
@@ -1456,10 +1497,11 @@ function RestoreButton({ jobId, h, onRestored }: {
   )
 }
 
-function HistoryRows({ scene, entries, token, onRestored, onEdit, onPreview }: {
+function HistoryRows({ scene, entries, token, canDownload, onRestored, onEdit, onPreview }: {
   scene: SceneItem
   entries: SceneHistoryItem[] | null | undefined
   token: string
+  canDownload: boolean
   onRestored: (updated: SceneItem) => void
   onEdit: (overrideScene: SceneItem) => void
   onPreview: (url: string) => void
@@ -1554,7 +1596,7 @@ function HistoryRows({ scene, entries, token, onRestored, onEdit, onPreview }: {
                   </button>
                 )}
                 {/* Download old version */}
-                {hasOldVideo && (
+                {hasOldVideo && canDownload && (
                   <a
                     href={`${base}/downloads/${histFilename}?token=${encodeURIComponent(token)}`}
                     download
@@ -1562,6 +1604,11 @@ function HistoryRows({ scene, entries, token, onRestored, onEdit, onPreview }: {
                   >
                     <IcoDownload className="w-3 h-3" /> Download
                   </a>
+                )}
+                {hasOldVideo && !canDownload && (
+                  <span className="inline-flex items-center gap-1 rounded-md border border-amber-800/40 bg-amber-950/30 px-2 py-1 text-[10px] font-medium text-amber-300">
+                    Preview only
+                  </span>
                 )}
                 {/* Edit */}
                 <button
@@ -1594,6 +1641,9 @@ export default function ExplorerPage() {
   const [contents,    setContents]    = useState<ExplorerContents | null>(null)
   const [loading,     setLoading]     = useState(true)
   const [modal,                   setModal]                   = useState<ModalState>({ type: 'none' })
+  const [subscriptionPlan,        setSubscriptionPlan]        = useState('free')
+  const [workspaceAccessChecked,  setWorkspaceAccessChecked]  = useState(false)
+  const [workspaceAccessDenied,   setWorkspaceAccessDenied]   = useState(false)
   const [token,                   setToken]                   = useState('')
   const [selectedScene,           setSelectedScene]           = useState<SceneItem | null>(null)
   const [historyPreviewUrl,       setHistoryPreviewUrl]       = useState<string | null>(null)
@@ -1602,6 +1652,10 @@ export default function ExplorerPage() {
   // exclusivity across all folders at every nesting depth, and gives us a
   // single place to close all menus (e.g. on navigation or modal open).
   const [openSubfolderDropdownId, setOpenSubfolderDropdownId] = useState<string | null>(null)
+  const { profile } = useSessionProfile({
+    redirectOnUnauthorized: true,
+    onUnauthorized: () => router.replace('/login'),
+  })
   const [dragItem,      setDragItem]      = useState<DragItem | null>(null)
   const [dragOverId,    setDragOverId]    = useState<string | null>(null)
   const dragItemRef = useRef<DragItem | null>(null)
@@ -1654,6 +1708,25 @@ export default function ExplorerPage() {
 
   useEffect(() => { setToken(localStorage.getItem('access_token') ?? '') }, [])
 
+  useEffect(() => {
+    if (profile === null) return
+    const plan = profile.subscription_plan ?? 'free'
+    const role = (profile.role ?? 'USER').toUpperCase()
+    const hasWorkspaceAccess = role === 'ROOT' || role === 'ADMIN' || plan.toLowerCase() !== 'free'
+
+    setSubscriptionPlan(plan)
+
+    if (!hasWorkspaceAccess) {
+      setWorkspaceAccessDenied(true)
+      setWorkspaceAccessChecked(true)
+      router.replace('/dashboard/billing?restricted=projects')
+      return
+    }
+
+    setWorkspaceAccessDenied(false)
+    setWorkspaceAccessChecked(true)
+  }, [profile, router])
+
   // ── Fetch contents whenever the active folder changes ───────────────────────
   const fetchContents = useCallback(async (folderId: string | null) => {
     setLoading(true)
@@ -1671,8 +1744,9 @@ export default function ExplorerPage() {
   }, [projectId])
 
   useEffect(() => {
+    if (!workspaceAccessChecked || workspaceAccessDenied) return
     fetchContents(currentFolderId)
-  }, [currentFolderId, fetchContents])
+  }, [currentFolderId, fetchContents, workspaceAccessChecked, workspaceAccessDenied])
 
   // ── Auto-refresh while scenes are active ────────────────────────────────────
   useEffect(() => {
@@ -1828,6 +1902,19 @@ export default function ExplorerPage() {
 
   const projectName = contents?.project_name ?? 'Project'
   const isEmpty     = !loading && contents && contents.folders.length === 0 && contents.scenes.length === 0
+  const planMaxHeight = getPlanMaxOutputHeight(subscriptionPlan)
+  const canDownloadRenderedVideo = subscriptionPlan.toLowerCase() !== 'free'
+
+  if (!workspaceAccessChecked || workspaceAccessDenied) {
+    return (
+      <div className="flex-1 flex items-center justify-center bg-slate-950">
+        <div className="flex flex-col items-center gap-3 text-center">
+          <div className="w-8 h-8 border-2 border-indigo-500 border-t-transparent rounded-full animate-spin" />
+          <p className="text-sm text-slate-500">Checking project access...</p>
+        </div>
+      </div>
+    )
+  }
 
   return (
     <div className="flex-1 flex flex-col min-h-0 overflow-y-auto bg-slate-950">
@@ -2236,11 +2323,16 @@ export default function ExplorerPage() {
                                     </button>
                                   )}
                                   {/* Download */}
-                                  {isCompleted && filename && (
+                                  {isCompleted && filename && canDownloadRenderedVideo && (
                                     <a href={downloadUrl} download
                                       className="inline-flex items-center gap-1 text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-500 border border-emerald-500/50 rounded-lg px-2.5 py-1.5 transition-all">
                                       <IcoDownload className="w-3 h-3" /> Download
                                     </a>
+                                  )}
+                                  {isCompleted && filename && !canDownloadRenderedVideo && (
+                                    <span className="inline-flex items-center gap-1 rounded-lg border border-amber-800/40 bg-amber-950/30 px-2.5 py-1.5 text-xs font-medium text-amber-300">
+                                      Preview only
+                                    </span>
                                   )}
                                   {/* Edit */}
                                   <button onClick={() => setModal({ type: 'edit_scene', scene: s })}
@@ -2285,6 +2377,7 @@ export default function ExplorerPage() {
                                 scene={s}
                                 entries={historyMap[s.job_id]}
                                 token={token}
+                                canDownload={canDownloadRenderedVideo}
                                 onRestored={handleSceneReprocessed}
                                 onEdit={overrideScene => setModal({ type: 'edit_scene', scene: overrideScene })}
                                 onPreview={url => setHistoryPreviewUrl(url)}
@@ -2322,6 +2415,7 @@ export default function ExplorerPage() {
         <AddSceneModal
           projectId={projectId}
           currentFolderId={currentFolderId}
+          planMaxHeight={planMaxHeight}
           onClose={closeModal}
           onQueued={handleSceneQueued}
         />
@@ -2386,6 +2480,7 @@ export default function ExplorerPage() {
       {modal.type === 'edit_scene' && (
         <EditSceneModal
           scene={modal.scene}
+          planMaxHeight={planMaxHeight}
           onClose={closeModal}
           onReprocessed={handleSceneReprocessed}
         />
@@ -2397,6 +2492,7 @@ export default function ExplorerPage() {
           scene={selectedScene}
           projectOriginalVideoPath={contents?.project_original_video_path ?? null}
           token={token}
+          canDownload={canDownloadRenderedVideo}
           onClose={() => setSelectedScene(null)}
         />
       )}

@@ -1,13 +1,26 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { useMemo } from 'react'
 import { useRouter } from 'next/navigation'
-import axios from 'axios'
-import api from '@/utils/api'
+import { useSessionProfile } from '@/hooks/useSessionProfile'
 
-interface UserMeta {
-  email: string
-  credit_minutes?: number
+function getRoleChip(role: string | undefined): { label: string; className: string; dotClass: string } | null {
+  const value = (role ?? '').toUpperCase()
+  if (value === 'ROOT') {
+    return {
+      label: 'ROOT Access',
+      className: 'border-fuchsia-800/60 bg-fuchsia-950/70 text-fuchsia-300',
+      dotClass: 'bg-fuchsia-300',
+    }
+  }
+  if (value === 'ADMIN') {
+    return {
+      label: 'Admin Access',
+      className: 'border-sky-800/60 bg-sky-950/70 text-sky-300',
+      dotClass: 'bg-sky-300',
+    }
+  }
+  return null
 }
 
 function getDisplayName(email: string): string {
@@ -33,22 +46,15 @@ function getGreeting(name: string): string {
 
 export default function Header() {
   const router = useRouter()
-  const [user, setUser] = useState<UserMeta | null>(null)
+  const { profile: user } = useSessionProfile({
+    redirectOnUnauthorized: true,
+    onUnauthorized: () => router.replace('/login'),
+  })
 
-  useEffect(() => {
-    api.get<UserMeta>('/api/auth/me')
-      .then(r => setUser(r.data))
-      .catch(err => {
-        if (axios.isAxiosError(err) && err.response?.status === 401) {
-          localStorage.clear()
-          router.replace('/login')
-        }
-      })
-  }, [])
-
-  const displayName = user ? getDisplayName(user.email) : 'Creator'
-  const greeting = getGreeting(displayName)
+  const displayName = useMemo(() => (user ? getDisplayName(user.email) : 'Creator'), [user])
+  const greeting = useMemo(() => getGreeting(displayName), [displayName])
   const isActive = (user?.credit_minutes ?? 0) > 0
+  const roleChip = getRoleChip(user?.role)
 
   return (
     <header className="bg-slate-900 text-white px-6 py-3.5 flex items-center justify-between gap-4 border-b border-slate-800 shrink-0">
@@ -70,6 +76,12 @@ export default function Header() {
                 <span className={`h-1.5 w-1.5 rounded-full ${isActive ? 'bg-emerald-400' : 'bg-amber-400'}`} />
                 {isActive ? 'Active Creator' : 'Ready to Refuel'}
               </span>
+              {roleChip && (
+                <span className={`inline-flex items-center gap-1.5 whitespace-nowrap rounded-full border px-3 py-1 text-[11px] font-semibold ${roleChip.className}`}>
+                  <span className={`h-1.5 w-1.5 rounded-full ${roleChip.dotClass}`} />
+                  {roleChip.label}
+                </span>
+              )}
             </div>
           </>
         )}

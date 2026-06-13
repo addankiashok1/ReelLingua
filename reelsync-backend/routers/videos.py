@@ -41,7 +41,13 @@ from fastapi import (
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from billing import get_generation_block_reason
+from billing import (
+    PROFIT_MARGIN_PERCENT,
+    clamp_render_output_height,
+    is_privileged_billing_role,
+    seconds_to_credit_balance,
+    verify_generation_access,
+)
 from config import PROFITABLE_TIERS, STORAGE_DIR
 from core.pipeline import MAX_CONCURRENT_JOBS, _job_semaphore, run_background_job
 from database import get_db
@@ -107,6 +113,7 @@ async def _list_projects(
             project_id=str(project.id),
             title=project.title,
             created_at=str(project.created_at),
+            original_video_path=project.original_video_path,
             latest_job_id=str(latest_job.id) if latest_job else None,
             latest_job_status=latest_job.status if latest_job else None,
             latest_job_language=latest_job.target_language if latest_job else None,
@@ -342,20 +349,15 @@ async def process_video(
 
     plan = (current_user.subscription_plan or "free").lower()
     required_seconds = get_video_duration_seconds(project.original_video_path)
-    generation_block_reason = get_generation_block_reason(
-        plan,
-        current_user.seconds_balance,
-        required_seconds,
+    verify_generation_access(
+        current_user=current_user,
+        incoming_video_duration=required_seconds,
+        logger=logger,
     )
-    if generation_block_reason:
-        raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail=generation_block_reason,
-        )
 
     # ── Pre-flight char-balance awareness (informational, not blocking) ───────
     remaining_seconds = current_user.seconds_balance or 0
-    if remaining_seconds < required_seconds * 2:
+    if not is_privileged_billing_role(getattr(current_user, "role", None)) and remaining_seconds < required_seconds * 2:
         logger.warning(
             f"[process] user={current_user.id} seconds_remaining={remaining_seconds} "
             f"is close to the required render duration ({required_seconds}s). "
@@ -377,7 +379,13 @@ async def process_video(
     output_aspect_ratio = body.target_aspect_ratio or "original"
     watermark_text = body.watermark_text or "ReelSync AI"
     native_height = get_video_height(project.original_video_path)
-    is_upscale_required = output_height > native_height
+    safe_output_height = clamp_render_output_height(
+        plan,
+        output_height,
+        native_height,
+        allow_upscale=True,
+    )
+    is_upscale_required = safe_output_height > native_height
 
     # Always INSERT a brand-new job row with a fresh UUID and timestamp.
     # Re-processing a project never touches prior job records — history is preserved.
@@ -389,7 +397,7 @@ async def process_video(
         subtitle_language=subtitle_lang,
         source_language=source_lang,
         original_height=native_height,
-        output_height=output_height,
+        output_height=safe_output_height or None,
         status="PENDING",
     )
     db.add(job)
@@ -414,7 +422,7 @@ async def process_video(
         subtitle_lang=subtitle_lang,
         source_lang=source_lang,
         scene_name=scene_name or "",
-        output_height=output_height,
+        output_height=safe_output_height,
         output_aspect_ratio=output_aspect_ratio,
         watermark_text=watermark_text,
         upscale_required=is_upscale_required,
@@ -526,16 +534,11 @@ async def rework_video(
     # ── Credit check ──────────────────────────────────────────────────────────
     plan = (current_user.subscription_plan or "free").lower()
     required_seconds = get_video_duration_seconds(original.original_video_path)
-    generation_block_reason = get_generation_block_reason(
-        plan,
-        current_user.seconds_balance,
-        required_seconds,
+    verify_generation_access(
+        current_user=current_user,
+        incoming_video_duration=required_seconds,
+        logger=logger,
     )
-    if generation_block_reason:
-        raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail=generation_block_reason,
-        )
 
     # ── Determine new project title ───────────────────────────────────────────
     import re as _re
@@ -574,7 +577,14 @@ async def rework_video(
     output_aspect_ratio = body.target_aspect_ratio or "original"
     watermark_text = body.watermark_text or "ReelSync AI"
     native_height = get_video_height(original.original_video_path)
-    is_upscale_required = output_height > native_height
+    plan = (current_user.subscription_plan or "free").lower()
+    safe_output_height = clamp_render_output_height(
+        plan,
+        output_height,
+        native_height,
+        allow_upscale=True,
+    )
+    is_upscale_required = safe_output_height > native_height
 
     job = RenderJob(
         id=uuid.uuid4(),
@@ -584,7 +594,7 @@ async def rework_video(
         subtitle_language=subtitle_lang,
         source_language=source_lang,
         original_height=native_height,
-        output_height=output_height,
+        output_height=safe_output_height or None,
         status="PENDING",
     )
     db.add(job)
@@ -607,7 +617,7 @@ async def rework_video(
         subtitle_lang=subtitle_lang,
         source_lang=source_lang,
         scene_name=scene_name,
-        output_height=output_height,
+        output_height=safe_output_height,
         output_aspect_ratio=output_aspect_ratio,
         watermark_text=watermark_text,
         upscale_required=is_upscale_required,
@@ -646,13 +656,24 @@ async def get_queue_status():
 
 @router.get(
     "/credits",
-    summary="Return the current user's remaining credit minutes",
+    summary="Return the current user's remaining processing balance",
 )
 async def get_credits(current_user: User = Depends(get_current_user)):
+    plan = current_user.subscription_plan or "free"
+    tier = PROFITABLE_TIERS.get(plan, PROFITABLE_TIERS["free"])
+    remaining_seconds = current_user.seconds_balance or 0
     return {
         "user_id": str(current_user.id),
         "credit_minutes": current_user.credit_minutes,
-        "credit_seconds": current_user.seconds_balance or 0,
+        "credit_seconds": remaining_seconds,
+        "credit_balance_credits": seconds_to_credit_balance(
+            current_user.subscription_plan,
+            remaining_seconds,
+        ),
+        "remaining_minutes": current_user.credit_minutes,
+        "plan_limit_minutes": tier["allowed_minutes"],
+        "plan_limit_seconds": tier["allowed_seconds"],
+        "is_recurring": tier["is_recurring"],
     }
 
 
@@ -664,7 +685,7 @@ async def get_credits(current_user: User = Depends(get_current_user)):
 )
 async def get_tier(current_user: User = Depends(get_current_user)):
     """
-    Exposes the exact second-based allowance plus derived minute values for UI.
+    Exposes the protected cycle allowance plus derived minute values for UI.
     """
     plan = current_user.subscription_plan or "free"
     tier = PROFITABLE_TIERS.get(plan, PROFITABLE_TIERS["free"])
@@ -672,11 +693,12 @@ async def get_tier(current_user: User = Depends(get_current_user)):
     seconds_balance = current_user.seconds_balance or 0
     credit_minutes = current_user.credit_minutes
     seconds_total_grant = max(tier["allowed_seconds"], seconds_balance)
+    credit_balance_credits = seconds_to_credit_balance(plan, seconds_balance)
 
     utilization_pct = (
-        round((1 - seconds_balance / seconds_total_grant) * 100, 1)
+        round((1 - seconds_balance / seconds_total_grant) * 100)
         if seconds_total_grant > 0
-        else 100.0
+        else 100
     )
 
     return {
@@ -684,11 +706,19 @@ async def get_tier(current_user: User = Depends(get_current_user)):
         "subscription_plan": plan,
         "tier_label": tier["label"],
         "advertised_minutes": tier["advertised_mins"],
+        "ui_display_minutes": tier["ui_display_minutes"],
+        "advertised_credits": tier["advertised_credits"],
         "allowed_minutes": tier["allowed_minutes"],
         "allowed_seconds": tier["allowed_seconds"],
+        "allowed_credits": tier["allowed_credits"],
         "credit_minutes": credit_minutes,
         "seconds_balance": seconds_balance,
+        "credit_balance_credits": credit_balance_credits,
         "seconds_total_grant": seconds_total_grant,
         "seconds_utilization_pct": utilization_pct,
+        "protected_credit_percent": PROFIT_MARGIN_PERCENT,
+        "project_access": tier["project_access"],
+        "workspace_project_limit": tier["workspace_project_limit"],
+        "is_recurring": tier["is_recurring"],
         "all_tiers": PROFITABLE_TIERS,
     }

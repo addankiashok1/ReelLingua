@@ -12,10 +12,18 @@ from sqlalchemy import delete, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from billing import BILLING_TIERS, get_cycle_allocation, plan_from_db
+from billing import (
+    BILLING_TIERS,
+    PROFIT_MARGIN_PERCENT,
+    get_cycle_allocation,
+    is_privileged_billing_role,
+    plan_from_db,
+    seconds_to_credit_balance,
+    sync_display_minutes,
+)
 from config import settings
 from database import get_db
-from models.db_models import OTPVerification, PasswordResetOTP, User
+from models.db_models import OTPVerification, PasswordResetOTP, User, bootstrap_role_for_email
 from models.schemas import (
     ForgotPasswordRequest,
     OTPVerify,
@@ -50,10 +58,16 @@ def verify_password(plain: str, hashed: str) -> bool:
 
 # ─── JWT helpers ──────────────────────────────────────────────────────────────
 
-def create_access_token(user_id: str, email: str) -> str:
+def create_access_token(user_id: str, email: str, role: str) -> str:
     expire = datetime.now(timezone.utc) + timedelta(hours=ACCESS_TOKEN_EXPIRE_HOURS)
     return jwt.encode(
-        {"sub": user_id, "email": email, "exp": expire},
+        {
+            "sub": email,
+            "email": email,
+            "user_id": user_id,
+            "role": role,
+            "exp": expire,
+        },
         settings.jwt_secret_key,
         algorithm=ALGORITHM,
     )
@@ -68,8 +82,8 @@ async def get_current_user(
     token = credentials.credentials
     try:
         payload = jwt.decode(token, settings.jwt_secret_key, algorithms=[ALGORITHM])
-        user_id: Optional[str] = payload.get("sub")
-        if not user_id:
+        subject: Optional[str] = payload.get("sub")
+        if not subject:
             raise JWTError("No subject in token")
     except JWTError:
         raise HTTPException(
@@ -77,7 +91,24 @@ async def get_current_user(
             detail="Invalid or expired access token.",
         )
 
-    user: Optional[User] = await db.get(User, uuid.UUID(user_id))
+    user: Optional[User] = None
+    token_user_id: Optional[str] = payload.get("user_id")
+
+    if token_user_id:
+        try:
+            user = await db.get(User, uuid.UUID(token_user_id))
+        except ValueError:
+            user = None
+
+    if not user:
+        try:
+            legacy_user_id = uuid.UUID(subject)
+        except ValueError:
+            result = await db.execute(select(User).where(User.email == subject.strip().lower()))
+            user = result.scalar_one_or_none()
+        else:
+            user = await db.get(User, legacy_user_id)
+
     if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -247,6 +278,7 @@ async def verify_otp(body: OTPVerify, db: AsyncSession = Depends(get_db)):
         credit_minutes=initial_allocation["credit_minutes"],
         seconds_balance=initial_allocation["seconds_balance"],
         subscription_plan="free",
+        role=bootstrap_role_for_email(record.email),
         chars_balance=initial_allocation["chars_balance"],
     )
 
@@ -267,7 +299,11 @@ async def verify_otp(body: OTPVerify, db: AsyncSession = Depends(get_db)):
     logger.info(f"[verify-otp] created user_id={new_user.id} email={new_user.email}")
 
     return Token(
-        access_token=create_access_token(str(new_user.id), new_user.email),
+        access_token=create_access_token(
+            str(new_user.id),
+            new_user.email,
+            getattr(new_user.role, "value", str(new_user.role or "USER")),
+        ),
         user_id=str(new_user.id),
         email=new_user.email,
     )
@@ -297,7 +333,11 @@ async def login(body: UserLogin, db: AsyncSession = Depends(get_db)):
     logger.info(f"[login] user_id={user.id}")
 
     return Token(
-        access_token=create_access_token(str(user.id), user.email),
+        access_token=create_access_token(
+            str(user.id),
+            user.email,
+            getattr(user.role, "value", str(user.role or "USER")),
+        ),
         user_id=str(user.id),
         email=user.email,
     )
@@ -310,17 +350,36 @@ async def login(body: UserLogin, db: AsyncSession = Depends(get_db)):
     response_model=UserOut,
     summary="Return the authenticated user's profile",
 )
-async def me(current_user: User = Depends(get_current_user)):
+async def me(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
     plan_key = plan_from_db(current_user.subscription_plan)  # uppercase e.g. "FREE"
     tier = BILLING_TIERS.get(plan_key, BILLING_TIERS["FREE"])
+    credit_seconds = current_user.seconds_balance or 0
+    if plan_key == "FREE" and not is_privileged_billing_role(getattr(current_user, "role", None)):
+        free_cap_seconds = int(tier["allowed_seconds"])
+        if credit_seconds > free_cap_seconds:
+            current_user.seconds_balance = free_cap_seconds
+            current_user.credit_minutes = sync_display_minutes(free_cap_seconds)
+            db.add(current_user)
+            await db.commit()
+            credit_seconds = free_cap_seconds
     return UserOut(
         user_id=str(current_user.id),
         email=current_user.email,
+        role=getattr(current_user.role, "value", str(current_user.role or "USER")),
         credit_minutes=current_user.credit_minutes,
-        credit_seconds=current_user.seconds_balance or 0,
+        credit_seconds=credit_seconds,
+        credit_balance_credits=seconds_to_credit_balance(current_user.subscription_plan, credit_seconds),
         subscription_plan=current_user.subscription_plan or "free",
         credit_limit_minutes=tier["min_limit"],
         credit_limit_seconds=tier["allowed_seconds"],
+        credit_limit_credits=tier["allowed_credits"],
+        advertised_credits=tier["advertised_credits"],
+        allowed_minutes=tier["allowed_minutes"],
+        protected_credit_percent=PROFIT_MARGIN_PERCENT,
+        is_recurring=tier["is_recurring"],
         phone_number=current_user.phone_number,
         profile_picture_url=current_user.profile_picture_url,
     )

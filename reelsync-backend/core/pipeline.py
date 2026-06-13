@@ -22,7 +22,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from sqlalchemy import Integer, cast, func, update
+from sqlalchemy import Integer, case, cast, func, update
 
 import config
 from config import MAX_CONCURRENT_JOBS
@@ -168,23 +168,15 @@ async def run_background_job(
             await set_status("EXTRACTED_AUDIO", progress_percentage=20)
             logger.info(f"[pipeline] job={job_id} → EXTRACTED_AUDIO  (submitting to ElevenLabs)")
 
-            # --- TEMPORARY DISABLED FOR DEBUGGING ---
-            # ai = get_orchestrator()
-            # dubbed_audio_path, subtitles_data, detected_src_lang = await asyncio.to_thread(
-            #     ai.generate_dubbed_audio,
-            #     video_local_path,
-            #     target_lang,
-            #     job_temp_dir,
-            #     source_lang,
-            #     apply_watermark,
-            # )
-            # ------------------------------------------
-            # MOCK BYPASS: Direct audio track pass-through from original uploaded file.
-            # Use the original video file audio so the downstream render pipeline remains functional.
-            dubbed_audio_path = video_local_path
-            subtitles_data = []
-            detected_src_lang = source_lang if source_lang != "auto" else None
-            logger.warning("⚠️ ElevenLabs bypassed: using original audio track for rendering tests.")
+            ai = get_orchestrator()
+            dubbed_audio_path, subtitles_data, detected_src_lang = await asyncio.to_thread(
+                ai.generate_dubbed_audio,
+                video_local_path,
+                target_lang,
+                job_temp_dir,
+                source_lang,
+                apply_watermark,
+            )
 
             # ── Milestone 3: CLONED_AUDIO (45%) — ElevenLabs returned ────────────
             # Write detected source language back to the job row so the dashboard
@@ -402,15 +394,17 @@ async def run_background_job(
             try:
                 async with AsyncSessionLocal() as session:
                     async with session.begin():
+                        remaining_seconds_expr = User.seconds_balance - required_seconds
                         result = await session.execute(
                             update(User)
                             .where(User.id == uuid.UUID(user_id))
                             .where(User.seconds_balance >= required_seconds)
                             .values(
-                                seconds_balance=User.seconds_balance - required_seconds,
-                                credit_minutes=cast(
-                                    func.ceil((User.seconds_balance - required_seconds) / 60.0),
-                                    Integer,
+                                seconds_balance=remaining_seconds_expr,
+                                credit_minutes=case(
+                                    (remaining_seconds_expr <= 0, 0),
+                                    (remaining_seconds_expr < 60, 1),
+                                    else_=cast(func.floor(remaining_seconds_expr / 60), Integer),
                                 ),
                             )
                             .returning(User.id)
