@@ -168,7 +168,8 @@ async def run_background_job(
             await set_status("EXTRACTED_AUDIO", progress_percentage=20)
             logger.info(f"[pipeline] job={job_id} → EXTRACTED_AUDIO  (submitting to ElevenLabs)")
 
-            ai = get_orchestrator()
+            ai = get_orchestrator(target_lang)
+            strict_speaker_count = 1
             dubbed_audio_path, subtitles_data, detected_src_lang = await asyncio.to_thread(
                 ai.generate_dubbed_audio,
                 video_local_path,
@@ -176,6 +177,7 @@ async def run_background_job(
                 job_temp_dir,
                 source_lang,
                 apply_watermark,
+                strict_speaker_count,
             )
 
             # ── Milestone 3: CLONED_AUDIO (45%) — ElevenLabs returned ────────────

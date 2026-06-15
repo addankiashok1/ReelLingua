@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import io
 import importlib
+import inspect
 import logging
 import os
 import subprocess
@@ -70,6 +71,37 @@ PREFERRED_REF_SECS = 10.0  # stop searching once we have this much audio
 
 # How many seconds of silence to pad between synthesised segments when mixing
 CROSSFADE_MS = 80
+SEGMENT_GAP_GUARD_MS = 60
+MERGEABLE_SEGMENT_GAP_SECONDS = 0.25
+GENERATED_SILENCE_THRESHOLD_DBFS = -42.0
+GENERATED_SILENCE_CHUNK_MS = 10
+
+# Collapse noisy diarization back to one speaker when a single voice clearly
+# dominates the recording. This avoids "extra voices" being cloned from
+# background bleed, breaths, or transient noise in one-person videos.
+SINGLE_SPEAKER_DOMINANCE_THRESHOLD = 0.82
+SINGLE_SPEAKER_MAX_SECONDARY_SECONDS = 6.0
+
+# Voice settings tuned for stable multilingual dubbing. Keeping stability near
+# the midpoint reduces drift across long segments, and a zero style setting
+# avoids secondary "ghost" voices pulled from noisy backgrounds.
+STABLE_VOICE_SETTINGS: dict[str, float | bool] = {
+    "stability": 0.62,
+    "similarity_boost": 0.9,
+    "style": 0.0,
+    "use_speaker_boost": True,
+}
+
+# Shared deterministic fallback for speakers that fail cloning. This preserves
+# speaker-to-voice consistency instead of allowing per-segment fallback changes.
+FALLBACK_VOICE_ID = "21m00Tcm4TlvDq8ikWAM"
+
+# Targets that must bypass the direct dubbing API and use the custom
+# cloned-speaker path instead. This is intentionally empty right now because
+# the active product model has been rolled back to the stable direct-dubbing
+# language set, and forcing supported languages into Tier 2 was causing the
+# mid-track silence / overlap issues.
+INDIAN_REGIONAL_LANGUAGE_CODES: frozenset[str] = frozenset()
 
 # ElevenLabs dubbing accepts only these source-language codes.
 _ELEVENLABS_SOURCE_LANGS: frozenset[str] = frozenset({
@@ -203,17 +235,35 @@ class AIOrchestrator:
             f"speakers={num_speakers or 'auto'}"
         )
 
+        supported_kwargs = set(
+            inspect.signature(self.client.dubbing.dub_a_video_or_an_audio_file).parameters.keys()
+        )
+
         with open(video_path, "rb") as fh:
+            # Audio isolation hook: if background music, room echo, or bleed is
+            # confusing the provider into inventing extra speakers, this is the
+            # exact boundary where a Demucs-style vocal separator should run so
+            # the API receives a cleaner mono dialogue track.
             kwargs: dict = {
                 "file":       (Path(video_path).name, fh, "video/mp4"),
                 "target_lang": target_lang,
                 "mode":        "automatic",
                 "watermark":   apply_watermark,
+                # Single-speaker lock for narrator-style source clips.
+                "num_speakers": max(int(num_speakers or 1), 1),
+                # `disable_voice_cloning` is intentionally omitted here. The
+                # API default is false (keep voice cloning enabled), and our
+                # installed SDK previously rejected that keyword directly.
             }
+            if "drop_background_audio" in supported_kwargs:
+                kwargs["drop_background_audio"] = True
+            else:
+                logger.info(
+                    "[Tier 1] Installed ElevenLabs SDK does not expose "
+                    "'drop_background_audio'; omitting that field for compatibility."
+                )
             if source_lang and source_lang != "auto" and source_lang in _ELEVENLABS_SOURCE_LANGS:
                 kwargs["source_lang"] = source_lang
-            if num_speakers and num_speakers > 1:
-                kwargs["num_speakers"] = num_speakers
 
             response = self.client.dubbing.dub_a_video_or_an_audio_file(**kwargs)
 
@@ -314,21 +364,32 @@ class DiarizedVoiceOrchestrator:
         output_dir: str,
         source_lang: str = "auto",
         apply_watermark: bool = True,
+        num_speakers: Optional[int] = None,
     ) -> tuple[str, list[dict], str]:
         """
         Run the full diarization pipeline.  Falls back to Tier 1 if anything
         goes wrong so the pipeline never stalls.
         """
+        normalized_target_lang = (target_lang or "").strip().lower()
+        requires_regional_tts = normalized_target_lang in INDIAN_REGIONAL_LANGUAGE_CODES
         try:
             return self._run_diarized(
-                video_path, target_lang, output_dir, source_lang, apply_watermark
+                video_path, target_lang, output_dir, source_lang, apply_watermark, num_speakers
             )
         except Exception as exc:
+            if requires_regional_tts:
+                logger.error(
+                    "[Tier 2] Regional target '%s' cannot fall back to Tier 1 direct dubbing. "
+                    "Original error: %s",
+                    normalized_target_lang,
+                    exc,
+                )
+                raise
             logger.warning(
                 f"[Tier 2] Pipeline failed ({exc}) — falling back to Tier 1 ElevenLabs Dubbing"
             )
             return self.tier1.generate_dubbed_audio(
-                video_path, target_lang, output_dir, source_lang, apply_watermark
+                video_path, target_lang, output_dir, source_lang, apply_watermark, num_speakers
             )
 
     # ── Step 1: extract raw audio ─────────────────────────────────────────────
@@ -352,6 +413,54 @@ class DiarizedVoiceOrchestrator:
             )
         logger.info(f"[Tier 2] Raw audio extracted → {wav_path}")
         return wav_path
+
+    def _prepare_dialogue_stem(self, wav_path: str, output_dir: str) -> str:
+        """
+        Prepare a speech-friendly mono track for diarization and Whisper.
+
+        If dub quality is being contaminated by music beds, room ambience, or
+        stacked speakers, insert a separator step here before diarization and
+        before reference-clip extraction. Example integration point:
+
+          dialogue_stem_path = run_demucs_or_audio_separator(wav_path, output_dir)
+          return dialogue_stem_path
+
+        For now we run a lightweight ffmpeg normalization pass that reduces low
+        rumble and high-frequency hiss, applies mild denoising, and normalizes
+        dialogue loudness. If ffmpeg cannot build the filtered stem, we fall
+        back to the original waveform.
+        """
+        stem_path = os.path.join(output_dir, "dialogue_stem_16k.wav")
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", wav_path,
+            "-af",
+            (
+                "highpass=f=120,"
+                "lowpass=f=7000,"
+                "afftdn=nf=-25,"
+                "loudnorm=I=-16:LRA=11:TP=-1.5"
+            ),
+            "-acodec", "pcm_s16le",
+            "-ac", "1",
+            "-ar", "16000",
+            stem_path,
+        ]
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=180,
+        )
+        if result.returncode != 0:
+            logger.warning(
+                "[Tier 2] Dialogue stem normalization failed; using raw audio instead. %s",
+                result.stderr.decode("utf-8", errors="replace")[:300],
+            )
+            return wav_path
+
+        logger.info("[Tier 2] Dialogue stem prepared → %s", stem_path)
+        return stem_path
 
     # ── Step 2: speaker diarization ───────────────────────────────────────────
 
@@ -497,6 +606,86 @@ class DiarizedVoiceOrchestrator:
 
         return speaker_voice_map, cloned_voice_ids
 
+    def _build_stable_speaker_voice_map(
+        self,
+        speaker_segments: dict[str, list[tuple[float, float]]],
+        speaker_voice_map: dict[str, str],
+    ) -> dict[str, str]:
+        """
+        Ensure every diarized speaker resolves to a deterministic voice ID.
+
+        Successful clones keep their own voice clone. Speakers that cannot be
+        cloned are pinned to a shared fallback voice so segment-to-segment
+        synthesis does not swap voices unpredictably.
+        """
+        stable_map = dict(speaker_voice_map)
+        for speaker_id in speaker_segments:
+            stable_map.setdefault(speaker_id, FALLBACK_VOICE_ID)
+        return stable_map
+
+    def _build_single_speaker_segments(self, wav_path: str) -> dict[str, list[tuple[float, float]]]:
+        """
+        Regional-language fallback when pyannote diarization is unavailable.
+        Treat the full dialogue track as one speaker so we can still stay on
+        the cloned-speaker TTS pipeline instead of the unsupported direct
+        dubbing endpoint.
+        """
+        if not _PYDUB_AVAILABLE:
+            raise RuntimeError("pydub required for single-speaker regional fallback.")
+
+        duration_seconds = len(_AudioSegment.from_wav(wav_path)) / 1000.0
+        if duration_seconds <= 0:
+            raise RuntimeError("Extracted audio duration is 0 seconds.")
+
+        logger.info(
+            "[Tier 2] Using single-speaker fallback segmentation for %.2fs of audio.",
+            duration_seconds,
+        )
+        return {"SPEAKER_00": [(0.0, duration_seconds)]}
+
+    def _should_force_single_speaker(
+        self,
+        speaker_segments: dict[str, list[tuple[float, float]]],
+    ) -> bool:
+        """
+        Decide whether diarization should be collapsed to one speaker.
+
+        Heuristic:
+        - if one detected speaker owns the large majority of speech time, and
+        - all remaining detected speakers are tiny fragments,
+        then those fragments are usually noise / bleed rather than real people.
+        """
+        if len(speaker_segments) <= 1:
+            return True
+
+        totals = {
+            speaker_id: sum(max(0.0, end - start) for start, end in segments)
+            for speaker_id, segments in speaker_segments.items()
+        }
+        overall_seconds = sum(totals.values())
+        if overall_seconds <= 0:
+            return True
+
+        primary_speaker, primary_seconds = max(totals.items(), key=lambda item: item[1])
+        primary_ratio = primary_seconds / overall_seconds
+        secondary_totals = [seconds for speaker_id, seconds in totals.items() if speaker_id != primary_speaker]
+        max_secondary_seconds = max(secondary_totals, default=0.0)
+
+        logger.info(
+            "[Tier 2] Speaker dominance check: primary=%s %.2fs (%.1f%%), "
+            "largest secondary=%.2fs across %d speaker(s)",
+            primary_speaker,
+            primary_seconds,
+            primary_ratio * 100.0,
+            max_secondary_seconds,
+            len(secondary_totals),
+        )
+
+        return (
+            primary_ratio >= SINGLE_SPEAKER_DOMINANCE_THRESHOLD
+            and max_secondary_seconds <= SINGLE_SPEAKER_MAX_SECONDARY_SECONDS
+        )
+
     # ── Step 5: transcribe + align speakers ───────────────────────────────────
 
     def _transcribe_and_align(
@@ -520,10 +709,15 @@ class DiarizedVoiceOrchestrator:
         whisper_lang = None if source_lang == "auto" else source_lang
         logger.info(f"[Tier 2] Transcribing audio (lang={whisper_lang or 'auto-detect'})…")
 
-        model = _WhisperModel("base", device="cpu", compute_type="int8")
-        segs, info = model.transcribe(wav_path, language=whisper_lang, beam_size=5)
-        detected_lang = info.language
-        logger.info(f"[Tier 2] Whisper detected language: {detected_lang}")
+        try:
+            model = _WhisperModel("base", device="cuda", compute_type="int8_float16")
+            logger.info("[Tier 2] faster-whisper using CUDA acceleration.")
+        except Exception as exc:
+            logger.warning(
+                "[Tier 2] CUDA Whisper init failed (%s). Falling back to CPU transcription.",
+                exc,
+            )
+            model = _WhisperModel("base", device="cpu", compute_type="int8")
 
         # Build a flat list of (start, end, speaker) intervals from diarization
         diar_flat: list[tuple[float, float, str]] = []
@@ -532,15 +726,57 @@ class DiarizedVoiceOrchestrator:
                 diar_flat.append((start, end, spk))
         diar_flat.sort(key=lambda x: x[0])
 
-        aligned: list[dict] = []
-        for seg in segs:
-            speaker = self._dominant_speaker(seg.start, seg.end, diar_flat)
-            aligned.append({
-                "start":   seg.start,
-                "end":     seg.end,
-                "text":    seg.text.strip(),
-                "speaker": speaker,
-            })
+        def _align_segments(transcribed_segments) -> list[dict]:
+            aligned_segments: list[dict] = []
+            for seg in transcribed_segments:
+                text = (seg.text or "").strip()
+                if not text:
+                    continue
+                speaker = self._dominant_speaker(seg.start, seg.end, diar_flat)
+                aligned_segments.append({
+                    "start":   seg.start,
+                    "end":     seg.end,
+                    "text":    text,
+                    "speaker": speaker,
+                })
+            return aligned_segments
+
+        segs, info = model.transcribe(wav_path, language=whisper_lang, beam_size=5)
+        detected_lang = info.language
+        aligned = _align_segments(segs)
+
+        if not aligned:
+            logger.warning(
+                "[Tier 2] Whisper produced no usable segments on the first pass. "
+                "Retrying with relaxed transcription settings."
+            )
+            segs, info = model.transcribe(
+                wav_path,
+                language=whisper_lang,
+                beam_size=1,
+                vad_filter=False,
+                condition_on_previous_text=False,
+            )
+            detected_lang = info.language
+            aligned = _align_segments(segs)
+
+        if not aligned and whisper_lang is not None:
+            logger.warning(
+                "[Tier 2] Whisper still found no usable segments with source_lang='%s'. "
+                "Retrying with automatic language detection.",
+                whisper_lang,
+            )
+            segs, info = model.transcribe(
+                wav_path,
+                language=None,
+                beam_size=1,
+                vad_filter=False,
+                condition_on_previous_text=False,
+            )
+            detected_lang = info.language
+            aligned = _align_segments(segs)
+
+        logger.info(f"[Tier 2] Whisper detected language: {detected_lang}")
 
         logger.info(f"[Tier 2] Transcription complete: {len(aligned)} segments")
         return aligned
@@ -603,7 +839,81 @@ class DiarizedVoiceOrchestrator:
         logger.info(f"[Tier 2] Translated {len(translated)} segments to '{target_lang}'")
         return translated
 
+    def _prepare_segments_for_mix(self, segments: list[dict]) -> list[dict]:
+        cleaned = [
+            {
+                **seg,
+                "text": (seg.get("text") or "").strip(),
+                "speaker": str(seg.get("speaker", "SPEAKER_00")),
+                "start": float(seg["start"]),
+                "end": float(seg["end"]),
+            }
+            for seg in segments
+            if (seg.get("text") or "").strip()
+        ]
+        if not cleaned:
+            return []
+
+        cleaned.sort(key=lambda seg: (seg["start"], seg["end"]))
+        merged: list[dict] = [cleaned[0].copy()]
+
+        for seg in cleaned[1:]:
+            current = merged[-1]
+            gap = seg["start"] - current["end"]
+            same_speaker = seg["speaker"] == current["speaker"]
+
+            if same_speaker and gap <= MERGEABLE_SEGMENT_GAP_SECONDS:
+                current["end"] = max(current["end"], seg["end"])
+                current["text"] = f"{current['text']} {seg['text']}".strip()
+                continue
+
+            if seg["start"] < current["end"]:
+                seg = {**seg, "start": current["end"]}
+            if seg["end"] <= seg["start"]:
+                seg = {**seg, "end": seg["start"] + 0.15}
+            merged.append(seg)
+
+        logger.info(
+            "[Tier 2] Segment prep merged %d transcript cues into %d dubbing chunks.",
+            len(cleaned),
+            len(merged),
+        )
+        return merged
+
     # ── Step 7 + 8: TTS synthesis + audio mixing ──────────────────────────────
+
+    def _trim_generated_clip_silence(self, clip: _AudioSegment) -> _AudioSegment:
+        if len(clip) <= GENERATED_SILENCE_CHUNK_MS * 2:
+            return clip
+
+        def _leading_silence_ms(segment: _AudioSegment) -> int:
+            trim_ms = 0
+            while trim_ms < len(segment):
+                chunk = segment[trim_ms:trim_ms + GENERATED_SILENCE_CHUNK_MS]
+                if chunk.dBFS == float("-inf") or chunk.dBFS < GENERATED_SILENCE_THRESHOLD_DBFS:
+                    trim_ms += GENERATED_SILENCE_CHUNK_MS
+                    continue
+                break
+            return min(trim_ms, len(segment))
+
+        lead_ms = _leading_silence_ms(clip)
+        tail_ms = _leading_silence_ms(clip.reverse())
+        if lead_ms == 0 and tail_ms == 0:
+            return clip
+
+        start_ms = min(lead_ms, len(clip))
+        end_ms = max(start_ms + 1, len(clip) - tail_ms)
+        trimmed = clip[start_ms:end_ms]
+        if len(trimmed) < max(150, len(clip) // 5):
+            return clip
+
+        logger.info(
+            "[Tier 2] Trimmed generated TTS padding: lead=%dms tail=%dms final=%dms.",
+            lead_ms,
+            tail_ms,
+            len(trimmed),
+        )
+        return trimmed
 
     def _synthesise_and_mix(
         self,
@@ -627,31 +937,59 @@ class DiarizedVoiceOrchestrator:
 
         total_duration_ms = int(segments[-1]["end"] * 1000) + 1000  # 1-second tail buffer
         base_track = _AudioSegment.silent(duration=total_duration_ms)
+        model_id = "eleven_multilingual_v2"
 
-        fallback_voice = "21m00Tcm4TlvDq8ikWAM"  # ElevenLabs "Rachel" — neutral English
+        def _fit_clip_to_slot(
+            clip: _AudioSegment,
+            start_ms: int,
+            fallback_end_ms: int,
+            next_start_ms: int | None,
+        ) -> _AudioSegment:
+            slot_end_ms = fallback_end_ms
+            if next_start_ms is not None:
+                slot_end_ms = min(slot_end_ms, max(start_ms + 1, next_start_ms - SEGMENT_GAP_GUARD_MS))
+
+            max_duration_ms = max(1, slot_end_ms - start_ms)
+            if len(clip) <= max_duration_ms:
+                return clip
+
+            logger.info(
+                "[Tier 2] Trimming synthesised segment from %dms to %dms to avoid voice overlap.",
+                len(clip),
+                max_duration_ms,
+            )
+            trimmed = clip[:max_duration_ms]
+            if len(trimmed) > SEGMENT_GAP_GUARD_MS * 2:
+                trimmed = trimmed.fade_out(min(CROSSFADE_MS, len(trimmed) // 3))
+            return trimmed
+
 
         for i, seg in enumerate(segments):
             if not seg["text"].strip():
                 continue
 
-            voice_id = speaker_voice_map.get(seg.get("speaker", ""), fallback_voice)
+            speaker_id = str(seg.get("speaker", "SPEAKER_00"))
+            voice_id = speaker_voice_map.get(speaker_id, FALLBACK_VOICE_ID)
             start_ms = int(seg["start"] * 1000)
+            fallback_end_ms = int(seg["end"] * 1000)
+            next_start_ms = (
+                int(segments[i + 1]["start"] * 1000)
+                if i + 1 < len(segments)
+                else None
+            )
 
             try:
                 audio_bytes = b"".join(
                     self.el_client.text_to_speech.convert(
                         voice_id=voice_id,
                         text=seg["text"],
-                        model_id="eleven_multilingual_v2",
-                        voice_settings={
-                            "stability":        0.45,
-                            "similarity_boost":  0.82,
-                            "style":             0.20,
-                            "use_speaker_boost": True,
-                        },
+                        model_id=model_id,
+                        voice_settings=STABLE_VOICE_SETTINGS,
                     )
                 )
                 clip = _AudioSegment.from_file(io.BytesIO(audio_bytes), format="mp3")
+                clip = self._trim_generated_clip_silence(clip)
+                clip = _fit_clip_to_slot(clip, start_ms, fallback_end_ms, next_start_ms)
 
                 # Crossfade if the previous segment ends near this start
                 if i > 0:
@@ -662,13 +1000,13 @@ class DiarizedVoiceOrchestrator:
                 base_track = base_track.overlay(clip, position=start_ms)
                 logger.debug(
                     f"[Tier 2] Segment {i+1}/{len(segments)} placed at {seg['start']:.2f}s "
-                    f"speaker={seg.get('speaker','?')} voice={voice_id}"
+                    f"speaker={speaker_id} voice={voice_id}"
                 )
 
             except Exception as exc:
                 logger.warning(
                     f"[Tier 2] TTS failed for segment {i+1} "
-                    f"(speaker={seg.get('speaker','?')}, text={seg['text'][:60]!r}): {exc}"
+                    f"(speaker={speaker_id}, text={seg['text'][:60]!r}): {exc}"
                 )
 
         mixed_path = os.path.join(output_dir, f"dubbed_{target_lang}.mp3")
@@ -731,27 +1069,59 @@ class DiarizedVoiceOrchestrator:
         output_dir: str,
         source_lang: str,
         apply_watermark: bool,
+        num_speakers: Optional[int] = None,
     ) -> tuple[str, list[dict], str]:
         cloned_voice_ids: list[str] = []
         project_id = Path(output_dir).name  # job_id used as temp project identifier
+        normalized_target_lang = (target_lang or "").strip().lower()
+        requires_regional_tts = normalized_target_lang in INDIAN_REGIONAL_LANGUAGE_CODES
 
         try:
             # 1 ─ Extract audio
             wav_path = self._extract_audio(video_path, output_dir)
+            wav_path = self._prepare_dialogue_stem(wav_path, output_dir)
 
             # 2 ─ Speaker diarization
-            speaker_segments = self._diarize(wav_path)
+            if requires_regional_tts and not _HUGGINGFACE_TOKEN:
+                logger.warning(
+                    "[Tier 2] HUGGINGFACE_TOKEN is not set for regional target '%s'. "
+                    "Using single-speaker cloned-TTS fallback.",
+                    normalized_target_lang,
+                )
+                speaker_segments = self._build_single_speaker_segments(wav_path)
+            elif int(num_speakers or 0) == 1:
+                logger.info(
+                    "[Tier 2] Strict single-speaker mode requested — bypassing diarization "
+                    "and locking the job to one narrator voice."
+                )
+                speaker_segments = self._build_single_speaker_segments(wav_path)
+            else:
+                speaker_segments = self._diarize(wav_path)
+
+            if len(speaker_segments) > 1 and self._should_force_single_speaker(speaker_segments):
+                logger.info(
+                    "[Tier 2] Collapsing noisy multi-speaker diarization to one speaker "
+                    "to preserve a single consistent voice."
+                )
+                speaker_segments = self._build_single_speaker_segments(wav_path)
 
             if len(speaker_segments) == 0:
                 raise RuntimeError("Diarization returned 0 speakers — cannot proceed.")
 
             if len(speaker_segments) == 1:
-                # Single speaker detected — Tier 1 with a speaker count hint is sufficient.
-                logger.info("[Tier 2] Single speaker detected — delegating to Tier 1 with hint.")
-                return self.tier1.generate_dubbed_audio(
-                    video_path, target_lang, output_dir, source_lang, apply_watermark,
-                    num_speakers=1,
-                )
+                if requires_regional_tts:
+                    logger.info(
+                        "[Tier 2] Single speaker detected for regional target '%s' — "
+                        "continuing with cloned-speaker synthesis.",
+                        normalized_target_lang,
+                    )
+                else:
+                    # Single speaker detected — Tier 1 with a speaker count hint is sufficient.
+                    logger.info("[Tier 2] Single speaker detected — delegating to Tier 1 with hint.")
+                    return self.tier1.generate_dubbed_audio(
+                        video_path, target_lang, output_dir, source_lang, apply_watermark,
+                        num_speakers=1,
+                    )
 
             logger.info(
                 f"[Tier 2] {len(speaker_segments)} speakers — running full voice-cloning pipeline"
@@ -760,6 +1130,10 @@ class DiarizedVoiceOrchestrator:
             # 3 + 4 ─ Extract reference clips and clone voices
             speaker_voice_map, cloned_voice_ids = self._clone_speaker_voices(
                 speaker_segments, wav_path, project_id, output_dir
+            )
+            speaker_voice_map = self._build_stable_speaker_voice_map(
+                speaker_segments,
+                speaker_voice_map,
             )
 
             if not speaker_voice_map:
@@ -771,6 +1145,10 @@ class DiarizedVoiceOrchestrator:
             aligned_segments = self._transcribe_and_align(
                 wav_path, speaker_segments, source_lang
             )
+            if not aligned_segments:
+                raise RuntimeError(
+                    "Whisper could not extract any spoken transcript segments from the source audio."
+                )
 
             # Detect source language from whisper for downstream metadata
             detected_src_lang = source_lang if source_lang != "auto" else "en"
@@ -779,6 +1157,11 @@ class DiarizedVoiceOrchestrator:
             translated_segments = self._translate_segments(
                 aligned_segments, target_lang, source_lang
             )
+            translated_segments = self._prepare_segments_for_mix(translated_segments)
+            if not any((seg.get("text") or "").strip() for seg in translated_segments):
+                raise RuntimeError(
+                    "Translated transcript segments were empty after preprocessing."
+                )
 
             # 7 + 8 ─ Synthesise TTS per segment and mix
             mixed_audio_path = self._synthesise_and_mix(
@@ -799,7 +1182,7 @@ class DiarizedVoiceOrchestrator:
 
 # ─── Public factory ───────────────────────────────────────────────────────────
 
-def get_orchestrator() -> AIOrchestrator | DiarizedVoiceOrchestrator:
+def get_orchestrator(target_lang: str | None = None) -> AIOrchestrator | DiarizedVoiceOrchestrator:
     """
     Return the appropriate orchestrator based on the runtime configuration.
 
@@ -809,11 +1192,14 @@ def get_orchestrator() -> AIOrchestrator | DiarizedVoiceOrchestrator:
     if _DIARIZATION_MODE:
         if not _HUGGINGFACE_TOKEN:
             logger.warning(
-                "[ai_client] ELEVENLABS_DIARIZATION_MODE=true but HUGGINGFACE_TOKEN is not set. "
+                "[ai_client] Diarized pipeline requested but HUGGINGFACE_TOKEN is not set. "
                 "Falling back to Tier 1 (ElevenLabs Dubbing API)."
             )
             return AIOrchestrator()
-        logger.info("[ai_client] Tier 2 (diarized voice-cloning pipeline) active.")
+        logger.info(
+            "[ai_client] Tier 2 (diarized voice-cloning pipeline) active for target=%s.",
+            target_lang or "auto",
+        )
         return DiarizedVoiceOrchestrator()
     return AIOrchestrator()
 

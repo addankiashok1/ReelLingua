@@ -365,7 +365,7 @@ async def process_video(
         )
 
     # ── Language parameters ───────────────────────────────────────────────────
-    # target_voice_language    → ElevenLabs dubbing language (validates against 32 codes)
+    # target_voice_language    → ReelSync dubbing target language
     # target_subtitle_language → subtitle burn language (validates against ~130 codes)
     # source_language          → "auto" (ElevenLabs detects) or explicit BCP-47 code
     #

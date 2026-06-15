@@ -4,6 +4,7 @@ import os
 import platform
 import shutil
 import subprocess
+import tempfile
 from typing import Optional
 
 import numpy as np
@@ -167,6 +168,90 @@ def _ffmpeg_scale(input_path: str, output_path: str, width: int, height: int) ->
         text=True,
         timeout=3600,
     )
+
+
+def _repair_video_for_moviepy(input_path: str) -> str:
+    """
+    Re-encode problematic uploads into a MoviePy-friendly MP4 container.
+
+    Some user uploads open in ffmpeg but fail when MoviePy tries to read their
+    first frame lazily. In that case we normalize the stream once and continue
+    the render against the repaired asset.
+    """
+    fd, repaired_path = tempfile.mkstemp(suffix=".mp4", prefix="reelsync_moviepy_fix_")
+    os.close(fd)
+    try:
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                input_path,
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a?",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-crf",
+                "18",
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+                "-c:a",
+                "aac",
+                "-ar",
+                "48000",
+                repaired_path,
+            ],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=3600,
+        )
+        return repaired_path
+    except Exception:
+        try:
+            os.remove(repaired_path)
+        except OSError:
+            pass
+        raise
+
+
+def _open_video_clip_with_fallback(video_path: str) -> tuple[VideoFileClip, Optional[str]]:
+    """
+    Open a video for MoviePy and validate that at least one frame is readable.
+
+    Returns:
+        (clip, repaired_temp_path)
+    """
+    try:
+        clip = VideoFileClip(video_path)
+        clip.get_frame(0)
+        return clip, None
+    except Exception as exc:
+        logger.warning(
+            "[video_processor] MoviePy could not read source video '%s' directly (%s). "
+            "Attempting ffmpeg normalization fallback.",
+            video_path,
+            exc,
+        )
+        try:
+            clip.close()
+        except Exception:
+            pass
+        repaired_path = _repair_video_for_moviepy(video_path)
+        repaired_clip = VideoFileClip(repaired_path)
+        repaired_clip.get_frame(0)
+        logger.info(
+            "[video_processor] Using normalized video fallback for MoviePy: %s",
+            repaired_path,
+        )
+        return repaired_clip, repaired_path
 
 
 def _escape_drawtext_text(text: str) -> str:
@@ -357,7 +442,8 @@ class VideoEngine:
         upscale_required: bool = False,
     ) -> str:
         logger.info(f"Loading video: {original_video_path}")
-        video = VideoFileClip(original_video_path)
+        repaired_video_path: Optional[str] = None
+        video, repaired_video_path = _open_video_clip_with_fallback(original_video_path)
 
         native_w = video.w
         native_h = video.h
@@ -515,6 +601,14 @@ class VideoEngine:
         video.close()
         audio.close()
         final.close()
+        if repaired_video_path:
+            try:
+                os.remove(repaired_video_path)
+            except OSError:
+                logger.warning(
+                    "[video_processor] Could not remove temporary repaired video: %s",
+                    repaired_video_path,
+                )
 
         return os.path.abspath(output_path)
 
@@ -532,7 +626,25 @@ class VideoEngine:
             logger.info(
                 f"Dubbed audio is {overhang:.2f}s longer — extending video by holding last frame."
             )
-            hold = ImageClip(video.get_frame(video_dur - 0.02)).set_duration(overhang)
+            freeze_candidates = [
+                max(video_dur - 0.02, 0),
+                max(video_dur - 0.25, 0),
+                max(video_dur - 0.5, 0),
+                0,
+            ]
+            freeze_frame = None
+            last_error: Exception | None = None
+            for freeze_t in freeze_candidates:
+                try:
+                    freeze_frame = video.get_frame(freeze_t)
+                    break
+                except Exception as exc:
+                    last_error = exc
+            if freeze_frame is None:
+                raise RuntimeError(
+                    f"Could not extract a readable frame for video extension: {last_error}"
+                ) from last_error
+            hold = ImageClip(freeze_frame).set_duration(overhang)
             return concatenate_videoclips([video, hold])
 
         logger.info(

@@ -165,7 +165,7 @@ class ProjectHistoryItem(BaseModel):
 
 # ─── Render Jobs ──────────────────────────────────────────────────────────────
 
-# ElevenLabs Dubbing API — confirmed supported language set (32 languages)
+# ReelSync target dubbing languages supported by the active multilingual model.
 _LANG_NAME_TO_CODE: dict[str, str] = {
     "arabic": "ar", "bulgarian": "bg", "chinese": "zh", "croatian": "hr",
     "czech": "cs", "danish": "da", "dutch": "nl", "english": "en",
@@ -181,14 +181,14 @@ _SUPPORTED_CODES: set[str] = set(_LANG_NAME_TO_CODE.values())
 
 
 def _validate_lang_code(v: str) -> str:
-    """Validate against ElevenLabs' 32 supported dubbing languages."""
+    """Validate against ReelSync's supported target-dubbing languages."""
     v = v.strip().lower()
     if v in _LANG_NAME_TO_CODE:
         v = _LANG_NAME_TO_CODE[v]
     if v not in _SUPPORTED_CODES:
         supported = ", ".join(sorted(_SUPPORTED_CODES))
         raise ValueError(
-            f"'{v}' is not supported by ElevenLabs Dubbing. "
+            f"'{v}' is not supported by ReelSync dubbing. "
             f"Supported codes: {supported}"
         )
     return v
